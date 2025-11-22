@@ -29,13 +29,20 @@ const SIZE: usize = LEN * std::mem::size_of::<Message<u64>>();
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} writer|reader", args[0]);
+        eprintln!("Usage: {} writer|reader|both", args[0]);
         std::process::exit(1);
     }
 
     match args[1].as_str() {
         "writer" => writer(),
         "reader" => reader(),
+        "both" => {
+            let sender = std::thread::spawn(writer);
+            let receiver = std::thread::spawn(reader);
+            sender.join().unwrap()?;
+            receiver.join().unwrap();
+            Ok(())
+        }
         _ => {
             eprintln!("Usage: {} writer|reader", args[0]);
             std::process::exit(1);
