@@ -2,8 +2,8 @@ use std::env;
 use std::io;
 use std::ptr;
 use std::slice;
-use std::time::Duration;
 use std::thread::sleep;
+use std::time::Duration;
 
 #[inline(always)]
 fn rdtscp() -> u64 {
@@ -40,7 +40,7 @@ fn main() -> io::Result<()> {
             let sender = std::thread::spawn(writer);
             let receiver = std::thread::spawn(reader);
             sender.join().unwrap()?;
-            receiver.join().unwrap();
+            receiver.join().unwrap()?;
             Ok(())
         }
         _ => {
@@ -65,6 +65,8 @@ fn writer() -> io::Result<()> {
 
     let buf = unsafe { slice::from_raw_parts_mut(addr as *mut Message<u64>, LEN) };
     println!("buf.len() = {}", buf.len());
+    let x = [1, 2, 3];
+    println!("{:?}", x.as_ptr() as *const u8);
 
     let mut tx = Sender::new(buf);
     loop {
@@ -72,8 +74,6 @@ fn writer() -> io::Result<()> {
         dbg!((tx.send(&ts), ts));
         sleep(Duration::from_millis(1000));
     }
-
-    Ok(())
 }
 
 fn reader() -> io::Result<()> {
@@ -98,15 +98,13 @@ fn reader() -> io::Result<()> {
         let ts1 = rdtscp();
         dbg!((seq_no, *ts0, ts1, ts1 - *ts0));
     }
-
-    Ok(())
 }
 
+use core::hint::spin_loop;
 use crossbeam::utils::CachePadded;
 use std::fmt::Debug;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicBool, AtomicU64};
-use core::hint::spin_loop;
 
 #[derive(Default)]
 struct State(AtomicU64);
@@ -158,16 +156,23 @@ pub struct Sender<'a, T> {
 impl<'a, T: Clone + Default> Sender<'a, T> {
     pub fn new(buffer: &'a mut [Message<T>]) -> Self {
         assert!(!buffer.len() >= 2);
-        let mut tx = Self {
-            position: 0,
-            seq_no: 0,
-            buffer,
-        };
-        tx.skip_to_last();
-        tx
+        if let Some(i) = buffer
+            .iter()
+            .position(|x| x.state.load(Ordering::SeqCst).0)
+        {
+            let mut tx = Self {
+                position: 0,
+                seq_no: 0,
+                buffer,
+            };
+            tx.skip_to_last();
+            tx
+        } else {
+            Self::with_init(buffer)
+        }
     }
 
-    pub fn with_init(&mut self, buffer: &'a mut [Message<T>]) -> Self {
+    pub fn with_init(buffer: &'a mut [Message<T>]) -> Self {
         assert!(!buffer.len() >= 2);
         buffer[0] = Message {
             state: CachePadded::new(State::new(true, 0)),
@@ -198,7 +203,6 @@ impl<'a, T: Clone + Default> Sender<'a, T> {
         }
     }
 
-
     #[inline(always)]
     pub fn send(&mut self, payload: &T) -> u64 {
         let next_position = (self.position + 1) % self.buffer.len();
@@ -210,8 +214,7 @@ impl<'a, T: Clone + Default> Sender<'a, T> {
         (*next_slot.payload).clone_from(payload);
 
         let slot = &mut self.buffer[self.position];
-        slot.state
-            .store(false, self.seq_no, Ordering::SeqCst);
+        slot.state.store(false, self.seq_no, Ordering::SeqCst);
 
         self.position = next_position;
         self.seq_no = next_seq_no;
@@ -251,7 +254,6 @@ impl<'a, T: Debug> Receiver<'a, T> {
         }
     }
 
-
     #[inline(always)]
     pub fn recv(&mut self) -> (u64, &T) {
         // Wait on `last`
@@ -268,7 +270,8 @@ impl<'a, T: Debug> Receiver<'a, T> {
             let next_position = (self.position + 1) % self.buffer.len();
             let next_slot = &self.buffer[next_position];
             let (last, seq_no) = next_slot.state.load(Ordering::SeqCst);
-            if last || seq_no != 0 { // or seq_no > self.seq_no
+            if last || seq_no != 0 {
+                // or seq_no > self.seq_no
                 self.position = next_position;
                 self.seq_no = seq_no.wrapping_add(1);
                 return (seq_no, &next_slot.payload);
