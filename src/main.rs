@@ -2,6 +2,7 @@ use std::env;
 use std::io;
 use std::ptr;
 use std::slice;
+//use std::io::Write;
 
 #[inline(always)]
 fn rdtscp() -> u64 {
@@ -20,9 +21,10 @@ fn rdtscp() -> u64 {
     ((high as u64) << 32) | (low as u64)
 }
 
+const N_RECEIVERS: usize = 5;
 const PAYLOAD_SIZE: usize = 400;
 const KEY: libc::key_t = 0x1234;
-const BUFFER_LEN: usize = 32;
+const BUFFER_LEN: usize = 4096;
 const BUFFER_SIZE: usize = BUFFER_LEN * std::mem::size_of::<Message<Payload<PAYLOAD_SIZE>>>();
 
 fn main() -> io::Result<()> {
@@ -36,10 +38,16 @@ fn main() -> io::Result<()> {
         "writer" => writer(),
         "reader" => reader(),
         "both" => {
+
+            let mut receivers = Vec::new();
+            for _ in 0..N_RECEIVERS {
+                receivers.push(std::thread::spawn(reader));
+            }
             let sender = std::thread::spawn(writer);
-            let receiver = std::thread::spawn(reader);
+            for _ in 0..N_RECEIVERS {
+                receivers.pop().unwrap().join().unwrap()?;
+            }
             sender.join().unwrap()?;
-            receiver.join().unwrap()?;
             Ok(())
         }
         _ => {
@@ -92,8 +100,8 @@ fn writer() -> io::Result<()> {
 
     trials.sort();
     trials2.sort();
-    trials.print("A");
-    trials2.print("X");
+    trials.print_csv("A");
+    trials2.print_csv("X");
 
     Ok(())
 }
@@ -122,6 +130,8 @@ fn reader() -> io::Result<()> {
     let mut rx = Receiver::new(buf);
 
     loop {
+        // print!("{}      \r", trials.len());
+        // io::stdout().flush().unwrap();
         let ts0 = rdtscp();
         let (_seq_no, payload) = rx.recv();
         let ts1 = payload.timestamp;
@@ -135,8 +145,8 @@ fn reader() -> io::Result<()> {
 
     trials.sort();
     trials2.sort();
-    trials.print("B");
-    trials2.print("C");
+    trials.print_csv("B");
+    trials2.print_csv("C");
 
     Ok(())
 }
@@ -328,7 +338,7 @@ impl<'a, T: Debug> Receiver<'a, T> {
                 // or seq_no > self.seq_no
                 self.position = next_position;
                 self.seq_no = seq_no.wrapping_add(1);
-                return (seq_no, &next_slot.payload);
+                return (seq_no, &next_slot.payload); // ???
             }
         }
     }
@@ -376,9 +386,9 @@ where
         &self.trials[idx]
     }
 
-    fn print(&self, title: &str) {
-        println!(
-            "{}: n={}, min={}, max={}, 10%={}, 50%={}, 75%={}, 90%={}, 95%={}, 99%={}, 99.9%={}, 99.99%={}, 99.999%={}, 99.99999%={}",
+    fn print_csv(&self, title: &str) {
+        println!("name,n,min,max,0.1,0.5,0.75,0.9,0.95,0.99,0.999,0.9999,0.99999");
+        println!("{},{},{},{},{},{},{},{},{},{},{},{},{}",
             title,
             self.len(),
             self.min(),
@@ -392,7 +402,7 @@ where
             self.quantile(0.999),
             self.quantile(0.9999),
             self.quantile(0.99999),
-            self.quantile(0.9999999)
         );
     }
+
 }
