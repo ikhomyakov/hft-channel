@@ -2,8 +2,6 @@ use std::env;
 use std::io;
 use std::ptr;
 use std::slice;
-use std::thread::sleep;
-use std::time::Duration;
 
 #[inline(always)]
 fn rdtscp() -> u64 {
@@ -22,9 +20,10 @@ fn rdtscp() -> u64 {
     ((high as u64) << 32) | (low as u64)
 }
 
+const PAYLOAD_SIZE: usize = 400;
 const KEY: libc::key_t = 0x1234;
-const LEN: usize = 32;
-const SIZE: usize = LEN * std::mem::size_of::<Message<u64>>();
+const BUFFER_LEN: usize = 32;
+const BUFFER_SIZE: usize = BUFFER_LEN * std::mem::size_of::<Message<Payload<PAYLOAD_SIZE>>>();
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -44,14 +43,14 @@ fn main() -> io::Result<()> {
             Ok(())
         }
         _ => {
-            eprintln!("Usage: {} writer|reader", args[0]);
+            eprintln!("Usage: {} writer|reader|both", args[0]);
             std::process::exit(1);
         }
     }
 }
 
 fn writer() -> io::Result<()> {
-    let shmid = unsafe { libc::shmget(KEY, SIZE, libc::IPC_CREAT | 0o600) };
+    let shmid = unsafe { libc::shmget(KEY, BUFFER_SIZE, libc::IPC_CREAT | 0o600) };
     if shmid == -1 {
         return Err(io::Error::last_os_error());
     }
@@ -63,34 +62,44 @@ fn writer() -> io::Result<()> {
 
     println!("writer: attached at {:p}, shmid = {}", addr, shmid);
 
-    let buf = unsafe { slice::from_raw_parts_mut(addr as *mut Message<u64>, LEN) };
+    let buf = unsafe {
+        slice::from_raw_parts_mut(addr as *mut Message<Payload<PAYLOAD_SIZE>>, BUFFER_LEN)
+    };
     println!("buf.len() = {}", buf.len());
-    let x = [1, 2, 3];
-    println!("{:?}", x.as_ptr() as *const u8);
+    // let x = [1, 2, 3];
+    // println!("{:?}", x.as_ptr() as *const u8);
 
     const TRIALS: usize = 100_000;
     let mut trials = Trials::with_capacity(TRIALS);
+    let mut trials2 = Trials::with_capacity(TRIALS);
+
+    let mut payload = Payload::<PAYLOAD_SIZE>::default();
 
     let mut tx = Sender::new(buf);
 
     loop {
         let ts0 = rdtscp();
-        tx.send(&ts0);
+        payload.timestamp = ts0;
+        tx.send(&payload);
         let ts1 = rdtscp();
+        let ts2 = rdtscp();
         trials.push(ts1 - ts0);
+        trials2.push(ts2 - ts1);
         if trials.len() == TRIALS {
             break;
         }
     }
 
     trials.sort();
+    trials2.sort();
     trials.print("A");
+    trials2.print("X");
 
     Ok(())
 }
 
 fn reader() -> io::Result<()> {
-    let shmid = unsafe { libc::shmget(KEY, SIZE, 0o600) };
+    let shmid = unsafe { libc::shmget(KEY, BUFFER_SIZE, 0o600) };
     if shmid == -1 {
         return Err(io::Error::last_os_error());
     }
@@ -102,7 +111,8 @@ fn reader() -> io::Result<()> {
 
     println!("reader: attached at {:p}, shmid = {}", addr, shmid);
 
-    let buf = unsafe { slice::from_raw_parts(addr as *const Message<u64>, LEN) };
+    let buf =
+        unsafe { slice::from_raw_parts(addr as *const Message<Payload<PAYLOAD_SIZE>>, BUFFER_LEN) };
     println!("buf.len() = {}", buf.len());
 
     const TRIALS: usize = 100_000;
@@ -113,7 +123,8 @@ fn reader() -> io::Result<()> {
 
     loop {
         let ts0 = rdtscp();
-        let (seq_no, ts1) = rx.recv();
+        let (_seq_no, payload) = rx.recv();
+        let ts1 = payload.timestamp;
         let ts2 = rdtscp();
         trials.push(ts2 - ts1);
         trials2.push(ts2 - ts0);
@@ -169,9 +180,25 @@ impl Debug for State {
     }
 }
 
+#[derive(Clone, Debug)]
+#[repr(C)]
+pub struct Payload<const N: usize> {
+    pub timestamp: u64,
+    pub bytes: [u8; N],
+}
+
+impl<const N: usize> Default for Payload<N> {
+    fn default() -> Self {
+        Self {
+            timestamp: 0,
+            bytes: [0u8; N],
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 #[repr(C)]
-struct Message<T: Sized> {
+pub struct Message<T: Sized> {
     state: CachePadded<State>,
     payload: CachePadded<T>,
 }
