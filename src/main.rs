@@ -38,7 +38,6 @@ fn main() -> io::Result<()> {
         "writer" => writer(),
         "reader" => reader(),
         "both" => {
-
             let mut receivers = Vec::new();
             for _ in 0..N_RECEIVERS {
                 receivers.push(std::thread::spawn(reader));
@@ -129,15 +128,27 @@ fn reader() -> io::Result<()> {
 
     let mut rx = Receiver::new(buf);
 
+    let mut prev_seq_no: u64 = 0;
     loop {
         // print!("{}      \r", trials.len());
         // io::stdout().flush().unwrap();
         let ts0 = rdtscp();
-        let (_seq_no, payload) = rx.recv();
-        let ts1 = payload.timestamp;
+        let (seq_no, ts1) = unsafe {
+            let (seq_no, payload) = rx.recv_unsafe();
+            (seq_no, payload.timestamp) // we may have UB here
+        };
         let ts2 = rdtscp();
         trials.push(ts2 - ts1);
         trials2.push(ts2 - ts0);
+        if prev_seq_no != 0 && prev_seq_no.wrapping_add(1) != seq_no {
+            println!(
+                "Skipped {} messages: prev seq_no {}, curr seq_no {}",
+                seq_no - prev_seq_no,
+                prev_seq_no,
+                seq_no
+            );
+        }
+        prev_seq_no = seq_no;
         if trials.len() == TRIALS {
             break;
         }
@@ -151,11 +162,10 @@ fn reader() -> io::Result<()> {
     Ok(())
 }
 
-use core::hint::spin_loop;
 use crossbeam::utils::CachePadded;
 use std::fmt::Debug;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
+//use std::sync::atomic::AtomicU64;
+use portable_atomic::{AtomicU64, Ordering};
 
 #[derive(Default)]
 struct State(AtomicU64);
@@ -268,6 +278,30 @@ impl<'a, T: Clone + Default> Sender<'a, T> {
     }
 
     #[inline(always)]
+    /// Sends a message into the channel by publishing the next slot and
+    /// returning its sequence number.
+    ///
+    /// This channel provides **no backpressure**: when the buffer becomes
+    /// full, sending a new message will **overwrite the oldest
+    /// message**. It is the receiver’s responsibility to keep up with the
+    /// sender if message loss is unacceptable. The receiver
+    /// can detect message loss by observing gaps in the monotonically
+    /// increasing `seq_no`.
+    ///
+    /// The channel’s protocol uses a `last` flag to indicate when a slot is
+    /// fully written and safe to read. The receiver spins until it sees that
+    /// the *previous* slot has `last = false`, meaning the sender has finished
+    /// publishing the next slot. Conversely, the sender must not clear the
+    /// previous slot’s `last` flag until the new payload is completely stored.
+    ///
+    /// This method follows that protocol by:
+    /// - marking the next slot as `last = true` (publish-in-progress),
+    /// - writing the payload,
+    /// - then clearing `last = false` on the previous slot (publish complete).
+    ///
+    /// Readers relying on this protocol must ensure they only read slots that
+    /// have been fully released (last==false); otherwise, they may observe partially written
+    /// payloads.
     pub fn send(&mut self, payload: &T) -> u64 {
         let next_position = (self.position + 1) % BUFFER_LEN;
         let seq_no = self.seq_no;
@@ -319,7 +353,20 @@ impl<'a, T: Debug> Receiver<'a, T> {
     }
 
     #[inline(always)]
-    pub fn recv(&mut self) -> (u64, &T) {
+    /// Returns the next available item in the buffer without any additional
+    /// synchronization and advances the internal cursor.
+    ///
+    /// This is a low–level, unsafe variant intended for highly optimized code
+    /// that knows exactly how the buffer is being used.
+    ///
+    /// # Safety
+    /// Returns a shared reference (`&T`) to data that may be concurrently
+    /// modified by other threads. The caller must ensure that no unsynchronized
+    /// writes occur to the returned payload for the entire lifetime of the reference.
+    ///
+    /// Failing to uphold this invariant may cause data races, torn reads,
+    /// or other undefined behavior.
+    pub unsafe fn recv_unsafe(&mut self) -> (u64, &T) {
         // Wait on `last`
         let slot = &self.buffer[self.position];
         let _seq_no = loop {
@@ -327,7 +374,7 @@ impl<'a, T: Debug> Receiver<'a, T> {
             if !last {
                 break seq_no;
             }
-            spin_loop();
+            // core::hint::spin_loop(); // Consider adding it. It adds `pause`.
         };
 
         loop {
@@ -388,7 +435,8 @@ where
 
     fn print_csv(&self, title: &str) {
         println!("name,n,min,max,0.1,0.5,0.75,0.9,0.95,0.99,0.999,0.9999,0.99999");
-        println!("{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        println!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{}",
             title,
             self.len(),
             self.min(),
@@ -404,5 +452,4 @@ where
             self.quantile(0.99999),
         );
     }
-
 }
