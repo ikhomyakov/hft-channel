@@ -222,7 +222,7 @@ pub struct Sender<'a, T> {
 
 impl<'a, T: Clone + Default> Sender<'a, T> {
     pub fn new(buffer: &'a mut [Message<T>]) -> Self {
-        assert!(!buffer.len() >= 2);
+        assert!(!BUFFER_LEN >= 2);
         if let Some(_) = buffer.iter().position(|x| x.state.load(Ordering::SeqCst).0) {
             let mut tx = Self {
                 position: 0,
@@ -237,12 +237,12 @@ impl<'a, T: Clone + Default> Sender<'a, T> {
     }
 
     pub fn with_init(buffer: &'a mut [Message<T>]) -> Self {
-        assert!(!buffer.len() >= 2);
+        assert!(!BUFFER_LEN >= 2);
         buffer[0] = Message {
             state: CachePadded::new(State::new(true, 0)),
             payload: CachePadded::new(T::default()),
         };
-        for i in 1..buffer.len() {
+        for i in 1..BUFFER_LEN {
             buffer[i] = Message {
                 state: CachePadded::new(State::new(false, 0)),
                 payload: CachePadded::new(T::default()),
@@ -263,13 +263,13 @@ impl<'a, T: Clone + Default> Sender<'a, T> {
                 self.seq_no = seq_no;
                 return;
             }
-            self.position = (self.position + 1) % self.buffer.len();
+            self.position = (self.position + 1) % BUFFER_LEN;
         }
     }
 
     #[inline(always)]
     pub fn send(&mut self, payload: &T) -> u64 {
-        let next_position = (self.position + 1) % self.buffer.len();
+        let next_position = (self.position + 1) % BUFFER_LEN;
         let seq_no = self.seq_no;
         let next_seq_no = seq_no.wrapping_add(1);
 
@@ -296,7 +296,7 @@ pub struct Receiver<'a, T: Debug> {
 
 impl<'a, T: Debug> Receiver<'a, T> {
     pub fn new(buffer: &'a [Message<T>]) -> Self {
-        assert!(!buffer.len() >= 2);
+        assert!(!BUFFER_LEN >= 2);
         let mut rx = Self {
             position: 0,
             seq_no: 0,
@@ -314,7 +314,7 @@ impl<'a, T: Debug> Receiver<'a, T> {
                 self.seq_no = seq_no;
                 return;
             }
-            self.position = (self.position + 1) % self.buffer.len();
+            self.position = (self.position + 1) % BUFFER_LEN;
         }
     }
 
@@ -331,7 +331,7 @@ impl<'a, T: Debug> Receiver<'a, T> {
         };
 
         loop {
-            let next_position = (self.position + 1) % self.buffer.len();
+            let next_position = (self.position + 1) % BUFFER_LEN;
             let next_slot = &self.buffer[next_position];
             let (last, seq_no) = next_slot.state.load(Ordering::SeqCst);
             if last || seq_no != 0 {
