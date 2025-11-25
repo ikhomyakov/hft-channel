@@ -22,9 +22,11 @@ fn rdtscp() -> u64 {
 }
 
 const N_RECEIVERS: usize = 5;
-const PAYLOAD_SIZE: usize = 400;
 const KEY: libc::key_t = 0x1234;
+
+const PAYLOAD_SIZE: usize = 400;
 const BUFFER_LEN: usize = 4096;
+const _: () = assert!(BUFFER_LEN.is_power_of_two() && BUFFER_LEN > 1);
 const BUFFER_SIZE: usize = BUFFER_LEN * std::mem::size_of::<Message<Payload<PAYLOAD_SIZE>>>();
 
 fn main() -> io::Result<()> {
@@ -163,38 +165,61 @@ fn reader() -> io::Result<()> {
 }
 
 use crossbeam::utils::CachePadded;
-use std::fmt::Debug;
-//use std::sync::atomic::AtomicU64;
 use portable_atomic::{AtomicU64, Ordering};
+use std::fmt::Debug;
 
+/// Packed state containing the dirty flag and sequence number.
+///
+/// Stored as a single `u64` inside an `AtomicU64`:
+///
+/// ```text
+/// [ dirty (1 bit, MSB) | seq_no (63 bits) ]
+///                bit 63        bits 0–62
+/// ```
+///
+/// # Meaning of states
+///
+/// - **dirty = false, seq_no = 0**  
+///   Slot is empty and has never been written.
+///
+/// - **dirty = false, seq_no > 0**  
+///   Slot holds a fully committed message.
+///
+/// - **dirty = true, seq_no = 0**  
+///   **Unreachable state.**  
+///   A slot cannot be dirty without an associated (non-zero) `seq_no`.
+///
+/// - **dirty = true,  seq_no > 0**  
+///   Slot is currently being written with a message identified by `seq_no`.
+///
 #[derive(Default)]
 struct State(AtomicU64);
 
-const LAST_BIT: u64 = 63;
-const LAST_MASK: u64 = 1 << LAST_BIT;
+const DIRTY_BIT: u64 = 63;
+const DIRTY_MASK: u64 = 1 << DIRTY_BIT;
 
 impl State {
-    fn new(last: bool, seq_no: u64) -> Self {
-        debug_assert!(seq_no < LAST_MASK);
-        Self(AtomicU64::new(seq_no | ((last as u64) << LAST_BIT)))
+    fn new(dirty: bool, seq_no: u64) -> Self {
+        debug_assert!(seq_no < DIRTY_MASK);
+        Self(AtomicU64::new(seq_no | ((dirty as u64) << DIRTY_BIT)))
     }
 
     fn load(&self, order: Ordering) -> (bool, u64) {
         let v = self.0.load(order);
-        (v & LAST_MASK != 0, v & !LAST_MASK)
+        (v & DIRTY_MASK != 0, v & !DIRTY_MASK)
     }
 
-    fn store(&self, last: bool, seq_no: u64, order: Ordering) {
-        let v = seq_no | ((last as u64) << LAST_BIT);
+    fn store(&self, dirty: bool, seq_no: u64, order: Ordering) {
+        let v = seq_no | ((dirty as u64) << DIRTY_BIT);
         self.0.store(v, order);
     }
 }
 
 impl Debug for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (last, seq_no) = self.load(Ordering::SeqCst);
+        let (dirty, seq_no) = self.load(Ordering::SeqCst);
         f.debug_struct("State")
-            .field("last", &last)
+            .field("dirty", &dirty)
             .field("seq_no", &seq_no)
             .finish()
     }
@@ -223,33 +248,62 @@ pub struct Message<T: Sized> {
     payload: CachePadded<T>,
 }
 
+/// Single-producer sender for a ring buffer.
+///
+/// This channel provides **no backpressure**: when the buffer becomes full,
+/// sending a new message will **overwrite the oldest message**. It is the
+/// receiver’s responsibility to keep up with the sender if message loss is
+/// unacceptable. The receiver can detect message loss by observing gaps in
+/// the monotonically increasing `seq_no`.
+///
+/// Receivers must only read the payload from slots that are **not dirty**,
+/// and after consuming the payload they must verify that the `seq_no` is
+/// unchanged. If `seq_no` changed, the slot was overwritten and the payload
+/// must be discarded.
+///
+/// # Protocol
+///
+/// The sender always keeps **one dirty slot**, which is the slot at `position`.
+/// Each publish performs:
+///
+/// 1. **Write** the message into the dirty slot at `position`.
+/// 2. **Dirty next slot** (`position + 1`), making it the next write target.
+/// 3. **Clear dirty on current slot**, signaling the write is complete.
+///
+/// This keeps at least one dirty slot at all times, allowing receivers to
+/// detect progress and catch up by scanning forward until they find a dirty
+/// slot, then waiting for dirty transitions.
+///
+/// # Fast wrap-around
+///
+/// If the sender wraps and overwrites a slot while a receiver is reading it,
+/// the receiver can use the `seq_no` to detect this: after reading the payload,
+/// it can check whether `seq_no` is unchanged. If it changed, the slot was
+/// overwritten and the receiver must discard the payload.
 #[derive(Debug)]
 pub struct Sender<'a, T> {
-    position: usize, // points to `last`
-    seq_no: u64,     // current `seq_no`
+    position: usize,
+    seq_no: u64,
     buffer: &'a mut [Message<T>],
 }
 
 impl<'a, T: Clone + Default> Sender<'a, T> {
     pub fn new(buffer: &'a mut [Message<T>]) -> Self {
-        assert!(!BUFFER_LEN >= 2);
-        if let Some(_) = buffer.iter().position(|x| x.state.load(Ordering::SeqCst).0) {
-            let mut tx = Self {
-                position: 0,
-                seq_no: 0,
+        if let Some(position) = buffer.iter().position(|x| x.state.load(Ordering::SeqCst).0) {
+            let (_, seq_no) = buffer[position].state.load(Ordering::SeqCst);
+            Self {
+                position,
+                seq_no,
                 buffer,
-            };
-            tx.skip_to_last();
-            tx
+            }
         } else {
             Self::with_init(buffer)
         }
     }
 
     pub fn with_init(buffer: &'a mut [Message<T>]) -> Self {
-        assert!(!BUFFER_LEN >= 2);
         buffer[0] = Message {
-            state: CachePadded::new(State::new(true, 0)),
+            state: CachePadded::new(State::new(true, 1)),
             payload: CachePadded::new(T::default()),
         };
         for i in 1..BUFFER_LEN {
@@ -260,134 +314,68 @@ impl<'a, T: Clone + Default> Sender<'a, T> {
         }
         Self {
             position: 0,
-            seq_no: 0,
+            seq_no: 1,
             buffer,
         }
     }
 
-    pub fn skip_to_last(&mut self) {
-        loop {
-            let slot = &self.buffer[self.position];
-            let (last, seq_no) = slot.state.load(Ordering::SeqCst);
-            if last {
-                self.seq_no = seq_no;
-                return;
-            }
-            self.position = (self.position + 1) % BUFFER_LEN;
-        }
-    }
-
     #[inline(always)]
-    /// Sends a message into the channel by publishing the next slot and
-    /// returning its sequence number.
-    ///
-    /// This channel provides **no backpressure**: when the buffer becomes
-    /// full, sending a new message will **overwrite the oldest
-    /// message**. It is the receiver’s responsibility to keep up with the
-    /// sender if message loss is unacceptable. The receiver
-    /// can detect message loss by observing gaps in the monotonically
-    /// increasing `seq_no`.
-    ///
-    /// The channel’s protocol uses a `last` flag to indicate when a slot is
-    /// fully written and safe to read. The receiver spins until it sees that
-    /// the *previous* slot has `last = false`, meaning the sender has finished
-    /// publishing the next slot. Conversely, the sender must not clear the
-    /// previous slot’s `last` flag until the new payload is completely stored.
-    ///
-    /// This method follows that protocol by:
-    /// - marking the next slot as `last = true` (publish-in-progress),
-    /// - writing the payload,
-    /// - then clearing `last = false` on the previous slot (publish complete).
-    ///
-    /// Readers relying on this protocol must ensure they only read slots that
-    /// have been fully released (last==false); otherwise, they may observe partially written
-    /// payloads.
     pub fn send(&mut self, payload: &T) -> u64 {
-        let next_position = (self.position + 1) % BUFFER_LEN;
+        let next_position = self.position.wrapping_add(1) % BUFFER_LEN;
+
         let seq_no = self.seq_no;
         let next_seq_no = seq_no.wrapping_add(1);
 
         let next_slot = &mut self.buffer[next_position];
         next_slot.state.store(true, next_seq_no, Ordering::SeqCst);
-        (*next_slot.payload).clone_from(payload);
 
         let slot = &mut self.buffer[self.position];
-        slot.state.store(false, self.seq_no, Ordering::SeqCst);
+        (*slot.payload).clone_from(payload);
+        slot.state.store(false, seq_no, Ordering::SeqCst);
 
         self.position = next_position;
         self.seq_no = next_seq_no;
-
-        next_seq_no
+        seq_no
     }
 }
 
 #[derive(Debug)]
 pub struct Receiver<'a, T: Debug> {
-    position: usize, // points to `last` (when all messages have been read)
-    seq_no: u64,     // current `seq_no`
+    position: usize, // points to `dirty` slot, i.e. the slot being written
+    seq_no: u64,     // current `seq_no`, i.e. the `seq_no` expected to be written
     buffer: &'a [Message<T>],
 }
 
 impl<'a, T: Debug> Receiver<'a, T> {
     pub fn new(buffer: &'a [Message<T>]) -> Self {
-        assert!(!BUFFER_LEN >= 2);
-        let mut rx = Self {
-            position: 0,
-            seq_no: 0,
-            buffer,
-        };
-        rx.skip_to_last();
-        rx
-    }
-
-    pub fn skip_to_last(&mut self) {
-        loop {
-            let slot = &self.buffer[self.position];
-            let (last, seq_no) = slot.state.load(Ordering::SeqCst);
-            if last {
-                self.seq_no = seq_no;
-                return;
+        if let Some(position) = buffer.iter().position(|x| x.state.load(Ordering::SeqCst).0) {
+            let (_, seq_no) = buffer[position].state.load(Ordering::SeqCst);
+            Self {
+                position,
+                seq_no,
+                buffer,
             }
-            self.position = (self.position + 1) % BUFFER_LEN;
+        } else {
+            panic!("Uninitialized buffer!");
         }
     }
 
     #[inline(always)]
-    /// Returns the next available item in the buffer without any additional
-    /// synchronization and advances the internal cursor.
-    ///
-    /// This is a low–level, unsafe variant intended for highly optimized code
-    /// that knows exactly how the buffer is being used.
-    ///
-    /// # Safety
-    /// Returns a shared reference (`&T`) to data that may be concurrently
-    /// modified by other threads. The caller must ensure that no unsynchronized
-    /// writes occur to the returned payload for the entire lifetime of the reference.
-    ///
-    /// Failing to uphold this invariant may cause data races, torn reads,
-    /// or other undefined behavior.
     pub unsafe fn recv_unsafe(&mut self) -> (u64, &T) {
-        // Wait on `last`
+        // Spin-wait on `dirty` flag
         let slot = &self.buffer[self.position];
-        let _seq_no = loop {
-            let (last, seq_no) = slot.state.load(Ordering::SeqCst);
-            if !last {
+        let seq_no = loop {
+            let (dirty, seq_no) = slot.state.load(Ordering::SeqCst);
+            if !dirty {
                 break seq_no;
             }
-            // core::hint::spin_loop(); // Consider adding it. It adds `pause`.
+            // core::hint::spin_loop(); // Consider adding it. It adds asm instruction `pause`.
         };
 
-        loop {
-            let next_position = (self.position + 1) % BUFFER_LEN;
-            let next_slot = &self.buffer[next_position];
-            let (last, seq_no) = next_slot.state.load(Ordering::SeqCst);
-            if last || seq_no != 0 {
-                // or seq_no > self.seq_no
-                self.position = next_position;
-                self.seq_no = seq_no.wrapping_add(1);
-                return (seq_no, &next_slot.payload); // ???
-            }
-        }
+        self.position = self.position.wrapping_add(1) % BUFFER_LEN;
+        self.seq_no = seq_no.wrapping_add(1);
+
+        (seq_no, &slot.payload)
     }
 }
 
