@@ -28,7 +28,7 @@
 
 ### Payload: 408 bytes
 
-```asm
+```gas
         rdtscp
 
         #NO_APP
@@ -63,7 +63,7 @@
 
 ### Payload: 208 bytes
 
-```asm
+```gas
         rdtscp
 
         #NO_APP
@@ -132,7 +132,7 @@
         }
 ```
 
-```asm
+```gas
         rdtscp
 
         #NO_APP
