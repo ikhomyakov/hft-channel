@@ -1,4 +1,4 @@
-## Writer
+## Send
 
 ```asm
         rdtscp
@@ -34,7 +34,7 @@
 ```
 
 
-## Reader
+## Recv
 
 ```asm
         rdtscp
