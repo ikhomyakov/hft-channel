@@ -1,5 +1,31 @@
 ## Send
 
+```rust
+...
+        let ts0 = rdtscp();
+        payload.timestamp = ts0;
+        tx.send(&payload);
+        let ts1 = rdtscp();
+...
+        pub fn send(&mut self, payload: &T) -> u64 {
+            let next_position = self.position.wrapping_add(1) % BUFFER_LEN;
+
+            let seq_no = self.seq_no;
+            let next_seq_no = seq_no.wrapping_add(1);
+
+            let next_slot = &mut self.buffer[next_position];
+            next_slot.state.store(true, next_seq_no, Ordering::SeqCst);
+
+            let slot = &mut self.buffer[self.position];
+            (*slot.payload).clone_from(payload);
+            slot.state.store(false, seq_no, Ordering::SeqCst);
+
+            self.position = next_position;
+            self.seq_no = next_seq_no;
+            seq_no
+        }
+```
+
 ### Payload: 408 bytes
 
 ```asm
@@ -78,6 +104,33 @@
 ```
 
 ## Recv
+
+```rust
+...
+        let ts0 = rdtscp();
+        let (seq_no, ts1) = unsafe {
+            let (seq_no, payload) = rx.recv_unsafe();
+            (seq_no, payload.timestamp) // we may have UB here
+        };
+        let ts2 = rdtscp();
+...
+        pub unsafe fn recv_unsafe(&mut self) -> (u64, &T) {
+            // Spin-wait on `dirty` flag
+            let slot = &self.buffer[self.position];
+            let seq_no = loop {
+                let (dirty, seq_no) = slot.state.load(Ordering::SeqCst);
+                if !dirty {
+                    break seq_no;
+                }
+                // core::hint::spin_loop(); // Consider adding it. It adds asm instruction `pause`.
+            };
+
+            self.position = self.position.wrapping_add(1) % BUFFER_LEN;
+            self.seq_no = seq_no.wrapping_add(1);
+
+            (seq_no, &slot.payload)
+        }
+```
 
 ```asm
         rdtscp
