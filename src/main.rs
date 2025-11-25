@@ -24,7 +24,7 @@ fn rdtscp() -> u64 {
 const N_RECEIVERS: usize = 5;
 const KEY: libc::key_t = 0x1234;
 
-const PAYLOAD_SIZE: usize = 400;
+const PAYLOAD_SIZE: usize = 200;
 const BUFFER_LEN: usize = 4096;
 const _: () = assert!(BUFFER_LEN.is_power_of_two() && BUFFER_LEN > 1);
 const BUFFER_SIZE: usize = BUFFER_LEN * std::mem::size_of::<Message<Payload<PAYLOAD_SIZE>>>();
