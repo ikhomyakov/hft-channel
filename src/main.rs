@@ -90,7 +90,7 @@ fn writer() -> io::Result<()> {
     loop {
         let ts0 = rdtscp();
         payload.timestamp = ts0;
-        tx.send(&payload);
+        tx.send(ts0, &payload);
         let ts1 = rdtscp();
         let ts2 = rdtscp();
         trials.push(ts1 - ts0);
@@ -137,18 +137,27 @@ fn reader() -> io::Result<()> {
         // io::stdout().flush().unwrap();
         let ts0 = rdtscp();
 
-        let (seq_no, ts1) = if true {
+        let (seq_no, ts1) = if false {
             // This performs a full payload copy.
-            let (seq_no, payload) = rx.recv();
-            (seq_no, payload.timestamp)
+            let (seq_no, user_state, payload) = rx.recv();
+            debug_assert!(user_state == payload.timestamp);
+            (seq_no, payload.timestamp) // payload reference is stable
+        } else if true {
+            // This avoids copying the payload by peeking directly into the slot.
+            // Prevents payload-related concurrency issues by not accessing the
+            // payload. Relies solely on user_state.
+            let (seq_no, user_state) = rx.load_state();
+            rx.advance();
+            (seq_no, user_state)
         } else {
             // This avoids copying the payload by peeking directly into the slot.
-            // `peek_unsafe` returns a reference into the ring buffer, and `advance`
+            // `peek_unsafe` returns a reference into the ring buffer, and `advance_checked`
             // confirms that the slot was not overwritten while reading it.
             loop {
-                let (seq_no, payload) = unsafe { rx.peek_unsafe() };
+                let (seq_no, user_state, payload) = unsafe { rx.peek_unsafe() };
                 let ts1 = payload.timestamp;
-                if rx.advance() {
+                if rx.advance_checked() {
+                    debug_assert!(user_state == ts1);
                     break (seq_no, ts1);
                 }
             }
@@ -179,73 +188,95 @@ fn reader() -> io::Result<()> {
     Ok(())
 }
 
-use crossbeam::utils::CachePadded;
-use portable_atomic::{AtomicU64, Ordering};
+use crossbeam_utils::CachePadded;
+use portable_atomic::{AtomicU128, Ordering};
 use std::fmt::Debug;
 
-/// Packed state containing the dirty flag and sequence number.
+/// Packed state containing the dirty flag, sequence number and user state.
 ///
-/// Stored as a single `u64` inside an `AtomicU64`:
+/// Stored as a single `u128` inside an `AtomicU128`:
 ///
-/// ```text
-/// [ dirty (1 bit, MSB) | seq_no (63 bits) ]
-///                bit 63        bits 0–62
-/// ```
+/// Layout (most-significant bit first):
+/// 127:      dirty flag (bool)
+/// 64–126:   seq_no (u64, 63 bits used)
+/// 0–63:     user_state (u64, all 64 bits)
 ///
 /// # Meaning of states
 ///
-/// - **dirty = false, seq_no = 0**  
+/// - **dirty = false, seq_no = 0**
 ///   Slot is empty and has never been written.
 ///
-/// - **dirty = false, seq_no > 0**  
+/// - **dirty = false, seq_no > 0**
 ///   Slot holds a fully committed message.
 ///
-/// - **dirty = true, seq_no = 0**  
-///   **Unreachable state.**  
+/// - **dirty = true, seq_no = 0**
+///   **Unreachable state.**
 ///   A slot cannot be dirty without an associated (non-zero) `seq_no`.
 ///
-/// - **dirty = true,  seq_no > 0**  
+/// - **dirty = true,  seq_no > 0**
 ///   Slot is currently being written with a message identified by `seq_no`.
-///
 #[derive(Default)]
-struct State(AtomicU64);
+struct State(AtomicU128);
 
-const DIRTY_BIT: u64 = 63;
-const DIRTY_MASK: u64 = 1 << DIRTY_BIT;
+const DIRTY_BIT: u32 = 127;
+const DIRTY_MASK: u128 = 1u128 << DIRTY_BIT;
+
+const SEQ_SHIFT: u32 = 64;
+const SEQ_BITS: u32 = 63;
+const SEQ_MASK: u128 = ((1u128 << SEQ_BITS) - 1) << SEQ_SHIFT;
+
+const USER_MASK: u128 = (1u128 << 64) - 1;
 
 impl State {
-    /// Creates a new packed state from a `dirty` flag and a `seq_no`.
+    /// Creates a new packed state from `dirty`, `seq_no`, and `user_state`.
     ///
     /// # Panics (debug only)
     ///
-    /// `seq_no` must fit in the low 63 bits; in debug builds this is checked
+    /// `seq_no` must fit in 63 bits; in debug builds this is checked
     /// with a `debug_assert!`.
-    fn new(dirty: bool, seq_no: u64) -> Self {
-        debug_assert!(seq_no < DIRTY_MASK);
-        Self(AtomicU64::new(seq_no | ((dirty as u64) << DIRTY_BIT)))
+    fn new(dirty: bool, seq_no: u64, user_state: u64) -> Self {
+        debug_assert!(seq_no < (1u64 << SEQ_BITS));
+
+        let dirty_bit = (dirty as u128) << DIRTY_BIT;
+        let seq_bits = (seq_no as u128) << SEQ_SHIFT;
+        let user_bits = user_state as u128;
+
+        Self(AtomicU128::new(dirty_bit | seq_bits | user_bits))
     }
 
     /// Loads the current state with the given memory ordering.
     ///
-    /// Returns `(dirty, seq_no)`.
-    fn load(&self, order: Ordering) -> (bool, u64) {
+    /// Returns `(dirty, seq_no, user_state)`.
+    fn load(&self, order: Ordering) -> (bool, u64, u64) {
         let v = self.0.load(order);
-        (v & DIRTY_MASK != 0, v & !DIRTY_MASK)
+
+        let dirty = (v & DIRTY_MASK) != 0;
+        let seq_no = ((v & SEQ_MASK) >> SEQ_SHIFT) as u64;
+        let user_state = (v & USER_MASK) as u64;
+
+        (dirty, seq_no, user_state)
     }
 
-    /// Stores a new `(dirty, seq_no)` pair with the given memory ordering.
-    fn store(&self, dirty: bool, seq_no: u64, order: Ordering) {
-        let v = seq_no | ((dirty as u64) << DIRTY_BIT);
+    /// Stores a new `(dirty, seq_no, user_state)` triple with the given memory ordering.
+    fn store(&self, dirty: bool, seq_no: u64, user_state: u64, order: Ordering) {
+        debug_assert!(seq_no < (1u64 << SEQ_BITS));
+
+        let dirty_bits = (dirty as u128) << DIRTY_BIT;
+        let seq_bits = (seq_no as u128) << SEQ_SHIFT;
+        let user_bits = user_state as u128;
+
+        let v = dirty_bits | seq_bits | user_bits;
         self.0.store(v, order);
     }
 }
 
 impl Debug for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (dirty, seq_no) = self.load(Ordering::SeqCst);
+        let (dirty, seq_no, user_state) = self.load(Ordering::SeqCst);
         f.debug_struct("State")
             .field("dirty", &dirty)
             .field("seq_no", &seq_no)
+            .field("user_state", &user_state)
             .finish()
     }
 }
@@ -328,7 +359,7 @@ impl<'a, T: Clone + Default> Sender<'a, T> {
     /// and initializes the entire ring buffer.
     pub fn new(buffer: &'a mut [Message<T>]) -> Self {
         if let Some(position) = buffer.iter().position(|x| x.state.load(Ordering::SeqCst).0) {
-            let (_, seq_no) = buffer[position].state.load(Ordering::SeqCst);
+            let (_, seq_no, _) = buffer[position].state.load(Ordering::SeqCst);
             Self {
                 position,
                 seq_no,
@@ -345,21 +376,23 @@ impl<'a, T: Clone + Default> Sender<'a, T> {
     ///
     /// - `dirty = true`
     /// - `seq_no = 1`
+    /// - `user_state = 0`
     ///
     /// All other slots are initialized as:
     ///
     /// - `dirty = false`
     /// - `seq_no = 0`
+    /// - `user_state = 0`
     ///
     /// This forms a valid starting state with a single dirty slot.
     pub fn with_init(buffer: &'a mut [Message<T>]) -> Self {
         buffer[0] = Message {
-            state: CachePadded::new(State::new(true, 1)),
+            state: CachePadded::new(State::new(true, 1, 0)),
             payload: CachePadded::new(T::default()),
         };
         for i in 1..BUFFER_LEN {
             buffer[i] = Message {
-                state: CachePadded::new(State::new(false, 0)),
+                state: CachePadded::new(State::new(false, 0, 0)),
                 payload: CachePadded::new(T::default()),
             };
         }
@@ -378,18 +411,21 @@ impl<'a, T: Clone + Default> Sender<'a, T> {
     /// one dirty slot in the ring. The method returns the `seq_no` for the current
     /// message, and afterward `self.position` points to the newly dirtied slot.
     #[inline(always)]
-    pub fn send(&mut self, payload: &T) -> u64 {
+    pub fn send(&mut self, user_state: u64, payload: &T) -> u64 {
         let next_position = self.position.wrapping_add(1) % BUFFER_LEN;
 
         let seq_no = self.seq_no;
         let next_seq_no = seq_no.wrapping_add(1);
 
         let next_slot = &mut self.buffer[next_position];
-        next_slot.state.store(true, next_seq_no, Ordering::SeqCst);
+        next_slot
+            .state
+            .store(true, next_seq_no, 0, Ordering::SeqCst);
 
         let slot = &mut self.buffer[self.position];
         (*slot.payload).clone_from(payload);
-        slot.state.store(false, seq_no, Ordering::SeqCst);
+        slot.state
+            .store(false, seq_no, user_state, Ordering::SeqCst);
 
         self.position = next_position;
         self.seq_no = next_seq_no;
@@ -429,7 +465,7 @@ impl<'a, T: Clone + Default + Debug> Receiver<'a, T> {
     /// or corrupted buffer.
     pub fn new(buffer: &'a [Message<T>]) -> Self {
         if let Some(position) = buffer.iter().position(|x| x.state.load(Ordering::SeqCst).0) {
-            let (_, seq_no) = buffer[position].state.load(Ordering::SeqCst);
+            let (_, seq_no, _) = buffer[position].state.load(Ordering::SeqCst);
             Self {
                 position,
                 seq_no,
@@ -454,16 +490,15 @@ impl<'a, T: Clone + Default + Debug> Receiver<'a, T> {
     ///
     /// This method will spin-wait if the slot is still dirty.
     #[inline(always)]
-    pub fn recv(&mut self) -> (u64, &T) {
+    pub fn recv(&mut self) -> (u64, u64, &T) {
         loop {
-            let seq_no = self.wait();
+            let (seq_no, user_state) = self.load_state();
             let slot = &self.buffer[self.position];
             self.recv_slot.clone_from(&slot.payload);
-            let (_, seq_no2) = self.load_state();
+            let (_, seq_no2, _) = self.try_load_state();
             if seq_no2 == seq_no {
-                self.position = self.position.wrapping_add(1) % BUFFER_LEN;
-                self.seq_no = seq_no.wrapping_add(1);
-                return (seq_no, &self.recv_slot);
+                self.advance();
+                return (seq_no, user_state, &self.recv_slot);
             }
         }
     }
@@ -474,26 +509,77 @@ impl<'a, T: Clone + Default + Debug> Receiver<'a, T> {
     ///
     /// Returns:
     ///
-    /// - `(seq_no, Some(&T))` on success, after advancing to the next slot.
-    /// - `(seq_no, None)` if the slot is dirty or if it was overwritten while
+    /// - `(seq_no, user_state, Some(&T))` on success, after advancing to the next slot.
+    /// - `(seq_no, user_state, None)` if the slot is dirty or if it was overwritten while
     ///   copying (detected by a changed `seq_no`). In this case, the receiver
     ///   does **not** advance to the next slot.
     #[inline(always)]
-    pub fn try_recv(&mut self) -> (u64, Option<&T>) {
-        let (dirty, seq_no) = self.load_state();
+    pub fn try_recv(&mut self) -> (u64, u64, Option<&T>) {
+        let (dirty, seq_no, user_state) = self.try_load_state();
         if !dirty {
             let slot = &self.buffer[self.position];
             self.recv_slot.clone_from(&(*slot.payload));
-            let (_, seq_no2) = self.load_state();
+            let (_, seq_no2, user_state2) = self.try_load_state();
             if seq_no2 == seq_no {
-                self.position = self.position.wrapping_add(1) % BUFFER_LEN;
-                self.seq_no = seq_no.wrapping_add(1);
-                (seq_no, Some(&self.recv_slot))
+                self.advance();
+                (seq_no, user_state, Some(&self.recv_slot))
             } else {
-                (seq_no2, None)
+                (seq_no2, user_state2, None)
             }
         } else {
-            (seq_no, None)
+            (seq_no, user_state, None)
+        }
+    }
+
+    /// Unsafely receives the next slot without copying the payload.
+    ///
+    /// Unlike a safe `recv`, this method returns a direct reference to the slot’s
+    /// payload inside the ring buffer. It also returns the associated `seq_no` and
+    /// `user_state`, which are the primary reasons to call this method.
+    ///
+    /// Because this operation *immediately advances* the receiver’s position,
+    /// there is **no way to verify** that the returned slot has not already been
+    /// overwritten by the sender. As a result, the returned reference may become
+    /// invalid at any time after this call.
+    ///
+    /// This is useful only in scenarios where avoiding a payload copy is critical
+    /// and the caller can guarantee that the slot will not be reused before the
+    /// reference is fully consumed, or when payload is not used at all.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the returned reference is **not used after the
+    /// underlying slot may have been overwritten** by the sender. Since this
+    /// method advances the receiver immediately, you cannot detect races the way
+    /// `peek_unsafe` + `advance_checked()` allows.
+    #[inline(always)]
+    pub unsafe fn recv_unsafe(&mut self) -> (u64, u64, &T) {
+        let (seq_no, user_state) = self.load_state();
+        self.advance();
+        let slot = &self.buffer[self.position];
+        (seq_no, user_state, &slot.payload)
+    }
+
+    /// Non-blocking version of [`Receiver::recv_unsafe`].
+    ///
+    /// Returns:
+    ///
+    /// - `(seq_no, user_state, Some(&T))` if the slot is currently clean (committed).
+    /// - `(seq_no, user_state, None)` if the slot is dirty (still being written).
+    ///
+    /// # Safety
+    ///
+    /// Same caveats as [`Receiver::recv_unsafe`]: the returned reference
+    /// may be invalidated if the slot is overwritten.
+    #[inline(always)]
+    pub unsafe fn try_recv_unsafe(&mut self) -> (u64, u64, Option<&T>) {
+        let (dirty, seq_no, user_state) = self.try_load_state();
+        let slot = &self.buffer[self.position];
+        if !dirty {
+            self.advance();
+            (seq_no, user_state, Some(&slot.payload))
+        } else {
+            (seq_no, user_state, None)
         }
     }
 
@@ -504,13 +590,13 @@ impl<'a, T: Clone + Default + Debug> Receiver<'a, T> {
     /// sender, the returned reference is only valid as long as the slot is
     /// not overwritten.
     ///
-    /// Use this together with [`Receiver::advance`] to validate the peek:
+    /// Use this together with [`Receiver::advance_checked`] to validate the peek:
     ///
     /// ```ignore
     /// loop {
-    ///     let (seq_no, payload) = rx.peek_unsafe();
+    ///     let (seq_no, user_state, payload) = rx.peek_unsafe();
     ///     // ... use `payload` speculatively ...
-    ///     if rx.advance() {
+    ///     if rx.advance_checked() {
     ///         // `payload` was not overwritten; work is valid.
     ///         break;
     ///     } else {
@@ -523,35 +609,35 @@ impl<'a, T: Clone + Default + Debug> Receiver<'a, T> {
     ///
     /// The caller must ensure that the reference is not used after the slot
     /// has potentially been overwritten. In practice, you must call
-    /// [`Receiver::advance`] and check its return value before relying on
+    /// [`Receiver::advance_checked`] and check its return value before relying on
     /// any work derived from `payload`.
     #[inline(always)]
-    pub unsafe fn peek_unsafe(&mut self) -> (u64, &T) {
-        let seq_no = self.wait();
+    pub unsafe fn peek_unsafe(&self) -> (u64, u64, &T) {
+        let (seq_no, user_state) = self.load_state();
         let slot = &self.buffer[self.position];
-        (seq_no, &slot.payload)
+        (seq_no, user_state, &slot.payload)
     }
 
     /// Non-blocking version of [`Receiver::peek_unsafe`].
     ///
     /// Returns:
     ///
-    /// - `(seq_no, Some(&T))` if the slot is currently clean (committed).
-    /// - `(seq_no, None)` if the slot is dirty (still being written).
+    /// - `(seq_no, user_state, Some(&T))` if the slot is currently clean (committed).
+    /// - `(seq_no, user_state, None)` if the slot is dirty (still being written).
     ///
     /// # Safety
     ///
     /// Same caveats as [`Receiver::peek_unsafe`]: the returned reference
     /// may be invalidated if the slot is overwritten, and must be validated
-    /// with [`Receiver::advance`].
+    /// with [`Receiver::advance_checked`].
     #[inline(always)]
-    pub unsafe fn try_peek_unsafe(&mut self) -> (u64, Option<&T>) {
-        let (dirty, seq_no) = self.load_state();
+    pub unsafe fn try_peek_unsafe(&self) -> (u64, u64, Option<&T>) {
+        let (dirty, seq_no, user_state) = self.try_load_state();
         let slot = &self.buffer[self.position];
         if !dirty {
-            (seq_no, Some(&slot.payload))
+            (seq_no, user_state, Some(&slot.payload))
         } else {
-            (seq_no, None)
+            (seq_no, user_state, None)
         }
     }
 
@@ -569,41 +655,51 @@ impl<'a, T: Clone + Default + Debug> Receiver<'a, T> {
     ///   - the receiver does **not** advance, and
     ///   - the method returns `false`.
     #[inline(always)]
-    pub fn advance(&mut self) -> bool {
-        let (_, seq_no) = self.load_state();
+    pub fn advance_checked(&mut self) -> bool {
+        let (_, seq_no, _) = self.try_load_state();
         let valid = self.seq_no == seq_no;
         self.position = self.position.wrapping_add(valid as usize) % BUFFER_LEN;
         self.seq_no = seq_no.wrapping_add(valid as u64);
         valid
     }
 
+    /// Advances the receiver past the current slot unconditionally.
+    ///
+    /// This is intended to be used after [`Receiver::load_state`] or.
+    /// [`Receiver::try_load_state`]).
+    #[inline(always)]
+    pub fn advance(&mut self) {
+        self.position = self.position.wrapping_add(1) % BUFFER_LEN;
+        self.seq_no = self.seq_no.wrapping_add(1);
+    }
+
     /// Spin-waits until the current slot becomes clean (committed).
     ///
     /// This loops while the dirty flag is set, repeatedly loading the state.
-    /// Once the slot is clean, it returns the observed `seq_no`.
+    /// Once the slot is clean, it returns the observed `seq_no` and `user_state`.
     #[inline(always)]
-    pub fn wait(&self) -> u64 {
+    pub fn load_state(&self) -> (u64, u64) {
         // Spin-wait on `dirty` flag
         let slot = &self.buffer[self.position];
-        let seq_no = loop {
-            let (dirty, seq_no) = slot.state.load(Ordering::SeqCst);
+        let (seq_no, user_state) = loop {
+            let (dirty, seq_no, user_state) = slot.state.load(Ordering::SeqCst);
             if !dirty {
-                break seq_no;
+                break (seq_no, user_state);
             }
             // core::hint::spin_loop(); // Consider adding it. It adds asm instruction `pause`.
         };
-        seq_no
+        (seq_no, user_state)
     }
 
-    /// Returns the current slot’s `(dirty, seq_no)` without blocking.
+    /// Returns the current slot’s `(dirty, seq_no, user_state)` without blocking.
     ///
     /// This method performs a single atomic load of the slot state at the
     /// receiver's current position. It does **not** spin-wait for the slot to
     /// become clean; callers must handle the case where `dirty == true`.
     ///
-    /// This is the non-blocking counterpart of [`Receiver::wait`].
+    /// This is the non-blocking counterpart of [`Receiver::load_state`].
     #[inline(always)]
-    pub fn load_state(&self) -> (bool, u64) {
+    pub fn try_load_state(&self) -> (bool, u64, u64) {
         let slot = &self.buffer[self.position];
         slot.state.load(Ordering::SeqCst)
     }
