@@ -26,7 +26,7 @@
         }
 ```
 
-### Payload: 408 bytes
+### Payload: 512 bytes
 
 ```gas
         rdtscp
@@ -36,32 +36,31 @@
         leal    1(%rsi), %ecx
         andl    $4095, %ecx
         leaq    1(%r14), %rsi
-        movq    %rcx, 88(%rsp)
+        movq    %rcx, 96(%rsp)
         leaq    (%rcx,%rcx,4), %rcx
         shll    $7, %ecx
-        movq    %rsi, 80(%rsp)
+        movq    %rsi, 88(%rsp)
         movabsq $-9223372036854775808, %rdi
         orq     %rdi, %rsi
-        movq    72(%rsp), %r13
-        xchgq   %rsi, (%r13,%rcx)
+        xchgq   %rsi, (%r15,%rcx)
         shlq    $32, %rdx
-        movl    %eax, %r15d
-        orq     %rdx, %r15
+        movl    %eax, %ebx
+        orq     %rdx, %rbx
         shlq    $7, %r12
-        movq    %r15, 128(%r13,%r12)
-        leaq    (%r12,%r13), %rdi
+        movq    %rbx, 128(%r15,%r12)
+        leaq    (%r15,%r12), %rdi
         addq    $136, %rdi
-        movl    $400, %edx
-        leaq    96(%rsp), %rsi
+        movl    $504, %edx
+        leaq    112(%rsp), %rsi
         vzeroupper
         callq   *memcpy@GOTPCREL(%rip)
-        xchgq   %r14, (%r13,%r12)
+        xchgq   %r14, (%r15,%r12)
         #APP
 
         rdtscp
 ```
 
-### Payload: 208 bytes
+### Payload: 256 bytes
 
 ```gas
         rdtscp
@@ -95,12 +94,15 @@
         vmovups %ymm0, 264(%rbx,%rax)
         vmovups 256(%rsp), %ymm0
         vmovups %ymm0, 296(%rbx,%rax)
-        movq    288(%rsp), %rcx
-        movq    %rcx, 328(%rbx,%rax)
+        vmovups 288(%rsp), %ymm0
+        vmovups %ymm0, 328(%rbx,%rax)
+        vmovups 312(%rsp), %ymm0
+        vmovups %ymm0, 352(%rbx,%rax)
         xchgq   %rsi, (%rbx,%rax)
         #APP
 
         rdtscp
+
 ```
 
 ## Recv
@@ -108,28 +110,32 @@
 ```rust
 ...
         let ts0 = rdtscp();
-        let (seq_no, ts1) = unsafe {
-            let (seq_no, payload) = rx.recv_unsafe();
-            (seq_no, payload.timestamp) // we may have UB here
-        };
+        let (seq_no, ts1) = {
+            // This path performs a full payload copy.
+            // In practice, the optimizer will only copy the bytes that are actually
+            // used. In this example, only the `timestamp` field (8 bytes) is copied
+            // out of the payload, not the entire payload buffer.
+            let (seq_no, payload) = rx.recv();
+            (seq_no, payload.timestamp)
+        }
         let ts2 = rdtscp();
 ...
-        pub unsafe fn recv_unsafe(&mut self) -> (u64, &T) {
-            // Spin-wait on `dirty` flag
-            let slot = &self.buffer[self.position];
-            let seq_no = loop {
-                let (dirty, seq_no) = slot.state.load(Ordering::SeqCst);
-                if !dirty {
-                    break seq_no;
+        pub fn recv(&mut self) -> (u64, &T) {
+            loop {
+                let seq_no = self.load_state();
+                let slot = &self.buffer[self.position];
+                self.recv_slot.clone_from(&slot.payload);
+                let (_, seq_no2) = self.try_load_state();
+                if seq_no2 == seq_no {
+                    self.position = self.position.wrapping_add(1) % BUFFER_LEN;
+                    self.seq_no = seq_no.wrapping_add(1);
+                    return (seq_no, &self.recv_slot);
                 }
-                // core::hint::spin_loop(); // Consider adding it. It adds asm instruction `pause`.
-            };
-
-            self.position = self.position.wrapping_add(1) % BUFFER_LEN;
-            self.seq_no = seq_no.wrapping_add(1);
-
-            (seq_no, &slot.payload)
+            }
         }
+
+
+
 ```
 
 ```gas

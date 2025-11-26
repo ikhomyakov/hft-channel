@@ -1,4 +1,5 @@
 use std::env;
+use std::fmt::Debug;
 use std::io;
 use std::ptr;
 use std::slice;
@@ -25,7 +26,7 @@ fn rdtscp() -> u64 {
 const N_RECEIVERS: usize = 5;
 const KEY: libc::key_t = 0x1234;
 
-const PAYLOAD_SIZE: usize = 200;
+const PAYLOAD_SIZE: usize = 248;
 const BUFFER_LEN: usize = 4096;
 const _: () = assert!(BUFFER_LEN.is_power_of_two() && BUFFER_LEN > 1);
 const BUFFER_SIZE: usize = BUFFER_LEN * std::mem::size_of::<Message<Payload<PAYLOAD_SIZE>>>();
@@ -138,17 +139,22 @@ fn reader() -> io::Result<()> {
         let ts0 = rdtscp();
 
         let (seq_no, ts1) = if true {
-            // This performs a full payload copy.
+            // This path performs a full payload copy.
+            // In practice, the optimizer will only copy the bytes that are actually
+            // used. In this example, only the `timestamp` field (8 bytes) is copied
+            // out of the payload, not the entire payload buffer.
             let (seq_no, payload) = rx.recv();
             (seq_no, payload.timestamp)
         } else {
-            // This avoids copying the payload by peeking directly into the slot.
-            // `peek_unsafe` returns a reference into the ring buffer, and `advance`
-            // confirms that the slot was not overwritten while reading it.
+            // This path avoids copying the payload entirely by reading it directly
+            // from the ring buffer.
+            // `peek_unsafe` returns a direct reference to the payload inside the slot.
+            // `advance_checked` verifies that the slot was not overwritten after the
+            // read; only then is the payload considered valid and the loop can exit.
             loop {
                 let (seq_no, payload) = unsafe { rx.peek_unsafe() };
                 let ts1 = payload.timestamp;
-                if rx.advance() {
+                if rx.advance_checked() {
                     break (seq_no, ts1);
                 }
             }
@@ -179,9 +185,8 @@ fn reader() -> io::Result<()> {
     Ok(())
 }
 
-use crossbeam::utils::CachePadded;
-use portable_atomic::{AtomicU64, Ordering};
-use std::fmt::Debug;
+use crossbeam_utils::CachePadded;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Packed state containing the dirty flag and sequence number.
 ///
@@ -313,8 +318,8 @@ pub struct Message<T: Sized> {
 /// overwritten and the receiver must discard the payload.
 #[derive(Debug)]
 pub struct Sender<'a, T> {
-    position: usize,
-    seq_no: u64,
+    position: usize, // points to `dirty` slot, i.e. the slot being written
+    seq_no: u64,     // current `seq_no`, i.e. the `seq_no` of the message being written
     buffer: &'a mut [Message<T>],
 }
 
@@ -411,10 +416,10 @@ impl<'a, T: Clone + Default> Sender<'a, T> {
 /// via the `seq_no` check.
 #[derive(Debug)]
 pub struct Receiver<'a, T> {
-    position: usize, // points to `dirty` slot, i.e. the slot being written
-    seq_no: u64,     // current `seq_no`, i.e. the `seq_no` expected to be written
+    position: usize, // points to next slot to be read
     buffer: &'a [Message<T>],
     recv_slot: T,
+    recv_seq_no: u64,
 }
 
 impl<'a, T: Clone + Default + Debug> Receiver<'a, T> {
@@ -429,12 +434,11 @@ impl<'a, T: Clone + Default + Debug> Receiver<'a, T> {
     /// or corrupted buffer.
     pub fn new(buffer: &'a [Message<T>]) -> Self {
         if let Some(position) = buffer.iter().position(|x| x.state.load(Ordering::SeqCst).0) {
-            let (_, seq_no) = buffer[position].state.load(Ordering::SeqCst);
             Self {
                 position,
-                seq_no,
                 buffer,
                 recv_slot: T::default(),
+                recv_seq_no: 0,
             }
         } else {
             panic!("Uninitialized buffer!");
@@ -456,13 +460,12 @@ impl<'a, T: Clone + Default + Debug> Receiver<'a, T> {
     #[inline(always)]
     pub fn recv(&mut self) -> (u64, &T) {
         loop {
-            let seq_no = self.wait();
+            let seq_no = self.load_state();
             let slot = &self.buffer[self.position];
             self.recv_slot.clone_from(&slot.payload);
-            let (_, seq_no2) = self.load_state();
+            let (_, seq_no2) = self.try_load_state();
             if seq_no2 == seq_no {
-                self.position = self.position.wrapping_add(1) % BUFFER_LEN;
-                self.seq_no = seq_no.wrapping_add(1);
+                self.advance();
                 return (seq_no, &self.recv_slot);
             }
         }
@@ -480,14 +483,13 @@ impl<'a, T: Clone + Default + Debug> Receiver<'a, T> {
     ///   does **not** advance to the next slot.
     #[inline(always)]
     pub fn try_recv(&mut self) -> (u64, Option<&T>) {
-        let (dirty, seq_no) = self.load_state();
+        let (dirty, seq_no) = self.try_load_state();
         if !dirty {
             let slot = &self.buffer[self.position];
             self.recv_slot.clone_from(&(*slot.payload));
-            let (_, seq_no2) = self.load_state();
+            let (_, seq_no2) = self.try_load_state();
             if seq_no2 == seq_no {
-                self.position = self.position.wrapping_add(1) % BUFFER_LEN;
-                self.seq_no = seq_no.wrapping_add(1);
+                self.advance();
                 (seq_no, Some(&self.recv_slot))
             } else {
                 (seq_no2, None)
@@ -504,13 +506,13 @@ impl<'a, T: Clone + Default + Debug> Receiver<'a, T> {
     /// sender, the returned reference is only valid as long as the slot is
     /// not overwritten.
     ///
-    /// Use this together with [`Receiver::advance`] to validate the peek:
+    /// Use this together with [`Receiver::advance_checked`] to validate the peek:
     ///
     /// ```ignore
     /// loop {
-    ///     let (seq_no, payload) = rx.peek_unsafe();
+    ///     let (seq_no, payload) = unsafe { rx.peek_unsafe() };
     ///     // ... use `payload` speculatively ...
-    ///     if rx.advance() {
+    ///     if rx.advance_checked() {
     ///         // `payload` was not overwritten; work is valid.
     ///         break;
     ///     } else {
@@ -523,11 +525,12 @@ impl<'a, T: Clone + Default + Debug> Receiver<'a, T> {
     ///
     /// The caller must ensure that the reference is not used after the slot
     /// has potentially been overwritten. In practice, you must call
-    /// [`Receiver::advance`] and check its return value before relying on
+    /// [`Receiver::advance_checked`] and check its return value before relying on
     /// any work derived from `payload`.
     #[inline(always)]
     pub unsafe fn peek_unsafe(&mut self) -> (u64, &T) {
-        let seq_no = self.wait();
+        let seq_no = self.load_state();
+        self.recv_seq_no = seq_no;
         let slot = &self.buffer[self.position];
         (seq_no, &slot.payload)
     }
@@ -543,12 +546,13 @@ impl<'a, T: Clone + Default + Debug> Receiver<'a, T> {
     ///
     /// Same caveats as [`Receiver::peek_unsafe`]: the returned reference
     /// may be invalidated if the slot is overwritten, and must be validated
-    /// with [`Receiver::advance`].
+    /// with [`Receiver::advance_checked`].
     #[inline(always)]
     pub unsafe fn try_peek_unsafe(&mut self) -> (u64, Option<&T>) {
-        let (dirty, seq_no) = self.load_state();
+        let (dirty, seq_no) = self.try_load_state();
         let slot = &self.buffer[self.position];
         if !dirty {
+            self.recv_seq_no = seq_no;
             (seq_no, Some(&slot.payload))
         } else {
             (seq_no, None)
@@ -569,12 +573,20 @@ impl<'a, T: Clone + Default + Debug> Receiver<'a, T> {
     ///   - the receiver does **not** advance, and
     ///   - the method returns `false`.
     #[inline(always)]
-    pub fn advance(&mut self) -> bool {
-        let (_, seq_no) = self.load_state();
-        let valid = self.seq_no == seq_no;
+    pub fn advance_checked(&mut self) -> bool {
+        let (_, seq_no) = self.try_load_state();
+        let valid = self.recv_seq_no == seq_no;
         self.position = self.position.wrapping_add(valid as usize) % BUFFER_LEN;
-        self.seq_no = seq_no.wrapping_add(valid as u64);
         valid
+    }
+
+    /// Advances the receiver past the current slot unconditionally.
+    ///
+    /// This is intended to be used after [`Receiver::load_state`] or.
+    /// [`Receiver::try_load_state`]).
+    #[inline(always)]
+    pub fn advance(&mut self) {
+        self.position = self.position.wrapping_add(1) % BUFFER_LEN;
     }
 
     /// Spin-waits until the current slot becomes clean (committed).
@@ -582,7 +594,7 @@ impl<'a, T: Clone + Default + Debug> Receiver<'a, T> {
     /// This loops while the dirty flag is set, repeatedly loading the state.
     /// Once the slot is clean, it returns the observed `seq_no`.
     #[inline(always)]
-    pub fn wait(&self) -> u64 {
+    pub fn load_state(&self) -> u64 {
         // Spin-wait on `dirty` flag
         let slot = &self.buffer[self.position];
         let seq_no = loop {
@@ -601,9 +613,9 @@ impl<'a, T: Clone + Default + Debug> Receiver<'a, T> {
     /// receiver's current position. It does **not** spin-wait for the slot to
     /// become clean; callers must handle the case where `dirty == true`.
     ///
-    /// This is the non-blocking counterpart of [`Receiver::wait`].
+    /// This is the non-blocking counterpart of [`Receiver::load_state`].
     #[inline(always)]
-    pub fn load_state(&self) -> (bool, u64) {
+    pub fn try_load_state(&self) -> (bool, u64) {
         let slot = &self.buffer[self.position];
         slot.state.load(Ordering::SeqCst)
     }
