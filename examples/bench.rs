@@ -1,21 +1,30 @@
+use ichannel::{Message, Receiver, Sender, Trials, mono_time_ns};
 use std::env;
 use std::io;
 use std::ptr;
 use std::slice;
-use ichannel::{BUFFER_LEN, BUFFER_SIZE, Payload, PAYLOAD_SIZE, Message, Trials, Sender, Receiver};
 
-/// Returns timestamp in ns
-#[cfg(unix)]
-#[inline(always)]
-fn mono_time_ns() -> u64 {
-    use libc::{CLOCK_MONOTONIC, clock_gettime, timespec};
-    unsafe {
-        let mut ts = timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        clock_gettime(CLOCK_MONOTONIC, &mut ts);
-        (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
+#[cfg(not(unix))]
+compile_error!("This crate only supports Unix-like operating systems.");
+
+const BUFFER_LEN: usize = 4096;
+const PAYLOAD_SIZE: usize = 248;
+const BUFFER_SIZE: usize = BUFFER_LEN * std::mem::size_of::<Message<Payload<PAYLOAD_SIZE>>>();
+
+/// Example payload type used in each ring-buffer slot (wrapped in a `Message`).
+#[derive(Clone, Debug)]
+#[repr(C)]
+pub struct Payload<const N: usize> {
+    pub timestamp: u64,
+    pub bytes: [u8; N],
+}
+
+impl<const N: usize> Default for Payload<N> {
+    fn default() -> Self {
+        Self {
+            timestamp: 0,
+            bytes: [0u8; N],
+        }
     }
 }
 
@@ -62,7 +71,7 @@ fn writer() -> io::Result<()> {
 
     let mut payload = Payload::<PAYLOAD_SIZE>::default();
 
-    let mut tx = Sender::new(buf);
+    let mut tx = Sender::<'_, _, BUFFER_LEN>::new(buf);
 
     loop {
         let ts0 = mono_time_ns();
@@ -106,7 +115,7 @@ fn reader() -> io::Result<()> {
     let mut trials = Trials::with_capacity(TRIALS);
     let mut trials2 = Trials::with_capacity(TRIALS);
 
-    let mut rx = Receiver::new(buf);
+    let mut rx = Receiver::<'_, _, BUFFER_LEN>::new(buf);
 
     let mut prev_seq_no: u64 = 0;
     loop {

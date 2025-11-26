@@ -1,7 +1,6 @@
-use std::fmt::Debug;
 use crossbeam_utils::CachePadded;
+use std::fmt::Debug;
 use std::sync::atomic::{AtomicU64, Ordering};
-use crate::BUFFER_LEN;
 
 /// Packed state containing the dirty flag and sequence number.
 ///
@@ -70,7 +69,7 @@ impl Debug for State {
     }
 }
 
-/// Internal ring-buffer slot.
+/// Ring buffer slot.
 ///
 /// Each `Message` consists of a `State` (dirty flag + sequence number)
 /// and a `payload`. Both fields are cache padded to reduce false sharing
@@ -115,13 +114,13 @@ pub struct Message<T: Sized> {
 /// it can check whether `seq_no` is unchanged. If it changed, the slot was
 /// overwritten and the receiver must discard the payload.
 #[derive(Debug)]
-pub struct Sender<'a, T> {
+pub struct Sender<'a, T, const BUFFER_LEN: usize> {
     position: usize, // points to `dirty` slot, i.e. the slot being written
     seq_no: u64,     // current `seq_no`, i.e. the `seq_no` of the message being written
     buffer: &'a mut [Message<T>],
 }
 
-impl<'a, T: Clone + Default> Sender<'a, T> {
+impl<'a, T: Clone + Default, const BUFFER_LEN: usize> Sender<'a, T, BUFFER_LEN> {
     /// Constructs a sender from an existing ring buffer.
     ///
     /// If the buffer already contains a dirty slot, this picks up from the
@@ -130,6 +129,7 @@ impl<'a, T: Clone + Default> Sender<'a, T> {
     /// If no dirty slot is found, this falls back to [`Sender::with_init`]
     /// and initializes the entire ring buffer.
     pub fn new(buffer: &'a mut [Message<T>]) -> Self {
+        assert!(BUFFER_LEN.is_power_of_two() && BUFFER_LEN > 1);
         if let Some(position) = buffer.iter().position(|x| x.state.load(Ordering::SeqCst).0) {
             let (_, seq_no) = buffer[position].state.load(Ordering::SeqCst);
             Self {
@@ -156,6 +156,7 @@ impl<'a, T: Clone + Default> Sender<'a, T> {
     ///
     /// This forms a valid starting state with a single dirty slot.
     pub fn with_init(buffer: &'a mut [Message<T>]) -> Self {
+        assert!(BUFFER_LEN.is_power_of_two() && BUFFER_LEN > 1);
         buffer[0] = Message {
             state: CachePadded::new(State::new(true, 1)),
             payload: CachePadded::new(T::default()),
@@ -213,14 +214,14 @@ impl<'a, T: Clone + Default> Sender<'a, T> {
 /// falls behind and its target slot is overwritten, it can detect this
 /// via the `seq_no` check.
 #[derive(Debug)]
-pub struct Receiver<'a, T> {
+pub struct Receiver<'a, T, const BUFFER_LEN: usize> {
     position: usize, // points to next slot to be read
     buffer: &'a [Message<T>],
     recv_slot: T,
     recv_seq_no: u64,
 }
 
-impl<'a, T: Clone + Default + Debug> Receiver<'a, T> {
+impl<'a, T: Clone + Default + Debug, const BUFFER_LEN: usize> Receiver<'a, T, BUFFER_LEN> {
     /// Constructs a receiver starting from the current dirty slot.
     ///
     /// This scans the buffer for a dirty slot (the one being written) and
@@ -231,6 +232,7 @@ impl<'a, T: Clone + Default + Debug> Receiver<'a, T> {
     /// Panics if no dirty slot is found, which indicates an uninitialized
     /// or corrupted buffer.
     pub fn new(buffer: &'a [Message<T>]) -> Self {
+        assert!(BUFFER_LEN.is_power_of_two() && BUFFER_LEN > 1);
         if let Some(position) = buffer.iter().position(|x| x.state.load(Ordering::SeqCst).0) {
             Self {
                 position,

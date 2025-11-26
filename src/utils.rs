@@ -1,3 +1,18 @@
+/// Returns timestamp in ns
+#[cfg(unix)]
+#[inline(always)]
+pub fn mono_time_ns() -> u64 {
+    use libc::{CLOCK_MONOTONIC, clock_gettime, timespec};
+    unsafe {
+        let mut ts = timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        clock_gettime(CLOCK_MONOTONIC, &mut ts);
+        (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
+    }
+}
+
 pub struct Trials<T> {
     trials: Vec<T>,
 }
