@@ -33,7 +33,7 @@ const KEY: libc::key_t = 0x1234;
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} writer|reader|both", args[0]);
+        eprintln!("Usage: {} writer|reader", args[0]);
         std::process::exit(1);
     }
 
@@ -47,6 +47,7 @@ fn main() -> io::Result<()> {
     }
 }
 
+#[inline(never)]
 fn writer() -> io::Result<()> {
     let shmid = unsafe { libc::shmget(KEY, BUFFER_SIZE, libc::IPC_CREAT | 0o600) };
     if shmid == -1 {
@@ -94,6 +95,7 @@ fn writer() -> io::Result<()> {
     Ok(())
 }
 
+#[inline(never)]
 fn reader() -> io::Result<()> {
     let shmid = unsafe { libc::shmget(KEY, BUFFER_SIZE, 0o600) };
     if shmid == -1 {

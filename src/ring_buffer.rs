@@ -47,12 +47,14 @@ impl State {
     /// Loads the current state with the given memory ordering.
     ///
     /// Returns `(dirty, seq_no)`.
+    #[inline(always)]
     fn load(&self, order: Ordering) -> (bool, u64) {
         let v = self.0.load(order);
         (v & DIRTY_MASK != 0, v & !DIRTY_MASK)
     }
 
     /// Stores a new `(dirty, seq_no)` pair with the given memory ordering.
+    #[inline(always)]
     fn store(&self, dirty: bool, seq_no: u64, order: Ordering) {
         let v = seq_no | ((dirty as u64) << DIRTY_BIT);
         self.0.store(v, order);

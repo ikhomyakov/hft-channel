@@ -1,6 +1,6 @@
 /// Returns timestamp in ns
 #[cfg(unix)]
-#[inline(always)]
+#[inline(never)]
 pub fn mono_time_ns() -> u64 {
     use libc::{CLOCK_MONOTONIC, clock_gettime, timespec};
     unsafe {

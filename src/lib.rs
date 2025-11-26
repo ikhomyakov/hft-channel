@@ -64,4 +64,4 @@ mod ring_buffer;
 mod utils;
 
 pub use ring_buffer::{Message, Receiver, Sender};
-pub use utils::{mono_time_ns, Trials};
+pub use utils::{Trials, mono_time_ns};
