@@ -4,6 +4,7 @@ use std::ptr;
 use std::slice;
 //use std::io::Write;
 
+/// Returns timestamp in CPU cycles
 #[inline(always)]
 fn rdtscp() -> u64 {
     let low: u32;
@@ -135,9 +136,9 @@ fn reader() -> io::Result<()> {
         // print!("{}      \r", trials.len());
         // io::stdout().flush().unwrap();
         let ts0 = rdtscp();
-        let (seq_no, ts1) = unsafe {
-            let (seq_no, payload) = rx.recv_unsafe();
-            (seq_no, payload.timestamp) // we may have UB here
+        let (seq_no, ts1) = {
+            let (seq_no, payload) = rx.recv();
+            (seq_no, payload.timestamp)
         };
         let ts2 = rdtscp();
         trials.push(ts2 - ts1);
@@ -199,16 +200,26 @@ const DIRTY_BIT: u64 = 63;
 const DIRTY_MASK: u64 = 1 << DIRTY_BIT;
 
 impl State {
+    /// Creates a new packed state from a `dirty` flag and a `seq_no`.
+    ///
+    /// # Panics (debug only)
+    ///
+    /// `seq_no` must fit in the low 63 bits; in debug builds this is checked
+    /// with a `debug_assert!`.
     fn new(dirty: bool, seq_no: u64) -> Self {
         debug_assert!(seq_no < DIRTY_MASK);
         Self(AtomicU64::new(seq_no | ((dirty as u64) << DIRTY_BIT)))
     }
 
+    /// Loads the current state with the given memory ordering.
+    ///
+    /// Returns `(dirty, seq_no)`.
     fn load(&self, order: Ordering) -> (bool, u64) {
         let v = self.0.load(order);
         (v & DIRTY_MASK != 0, v & !DIRTY_MASK)
     }
 
+    /// Stores a new `(dirty, seq_no)` pair with the given memory ordering.
     fn store(&self, dirty: bool, seq_no: u64, order: Ordering) {
         let v = seq_no | ((dirty as u64) << DIRTY_BIT);
         self.0.store(v, order);
@@ -225,6 +236,7 @@ impl Debug for State {
     }
 }
 
+/// Example payload type used in each ring-buffer slot (wrapped in a `Message`).
 #[derive(Clone, Debug)]
 #[repr(C)]
 pub struct Payload<const N: usize> {
@@ -241,6 +253,11 @@ impl<const N: usize> Default for Payload<N> {
     }
 }
 
+/// Internal ring-buffer slot.
+///
+/// Each `Message` consists of a `State` (dirty flag + sequence number)
+/// and a `payload`. Both fields are cache padded to reduce false sharing
+/// between producer and consumers.
 #[derive(Debug, Default)]
 #[repr(C)]
 pub struct Message<T: Sized> {
@@ -288,6 +305,13 @@ pub struct Sender<'a, T> {
 }
 
 impl<'a, T: Clone + Default> Sender<'a, T> {
+    /// Constructs a sender from an existing ring buffer.
+    ///
+    /// If the buffer already contains a dirty slot, this picks up from the
+    /// position and `seq_no` that the previous sender left off at.
+    ///
+    /// If no dirty slot is found, this falls back to [`Sender::with_init`]
+    /// and initializes the entire ring buffer.
     pub fn new(buffer: &'a mut [Message<T>]) -> Self {
         if let Some(position) = buffer.iter().position(|x| x.state.load(Ordering::SeqCst).0) {
             let (_, seq_no) = buffer[position].state.load(Ordering::SeqCst);
@@ -301,6 +325,19 @@ impl<'a, T: Clone + Default> Sender<'a, T> {
         }
     }
 
+    /// Constructs a sender and unconditionally initializes the ring buffer.
+    ///
+    /// Slot `0` is initialized as:
+    ///
+    /// - `dirty = true`
+    /// - `seq_no = 1`
+    ///
+    /// All other slots are initialized as:
+    ///
+    /// - `dirty = false`
+    /// - `seq_no = 0`
+    ///
+    /// This forms a valid starting state with a single dirty slot.
     pub fn with_init(buffer: &'a mut [Message<T>]) -> Self {
         buffer[0] = Message {
             state: CachePadded::new(State::new(true, 1)),
@@ -319,6 +356,13 @@ impl<'a, T: Clone + Default> Sender<'a, T> {
         }
     }
 
+    /// Sends a message into the ring buffer.
+    ///
+    /// The sender marks the next slot as dirty with the next `seq_no`, writes
+    /// the payload into the current slot, and commits the current slot by clearing
+    /// its dirty flag. This preserves the invariant that there is always at least
+    /// one dirty slot in the ring. The method returns the `seq_no` for the current
+    /// message, and afterward `self.position` points to the newly dirtied slot.
     #[inline(always)]
     pub fn send(&mut self, payload: &T) -> u64 {
         let next_position = self.position.wrapping_add(1) % BUFFER_LEN;
@@ -339,14 +383,36 @@ impl<'a, T: Clone + Default> Sender<'a, T> {
     }
 }
 
+/// Multi-receiver handle for reading from a ring buffer.
+///
+/// A `Receiver`:
+///
+/// - does not mutate the underlying ring buffer’s structure,
+/// - tracks its own read position and expected `seq_no`, and
+/// - maintains a single temporary slot (`recv_slot`) used to return
+///   stable references to payloads.
+///
+/// Each receiver can lag behind of the sender. If a receiver
+/// falls behind and its target slot is overwritten, it can detect this
+/// via the `seq_no` check.
 #[derive(Debug)]
-pub struct Receiver<'a, T: Debug> {
+pub struct Receiver<'a, T> {
     position: usize, // points to `dirty` slot, i.e. the slot being written
     seq_no: u64,     // current `seq_no`, i.e. the `seq_no` expected to be written
     buffer: &'a [Message<T>],
+    recv_slot: T,
 }
 
-impl<'a, T: Debug> Receiver<'a, T> {
+impl<'a, T: Clone + Default + Debug> Receiver<'a, T> {
+    /// Constructs a receiver starting from the current dirty slot.
+    ///
+    /// This scans the buffer for a dirty slot (the one being written) and
+    /// initializes the receiver’s `position` and `seq_no` accordingly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no dirty slot is found, which indicates an uninitialized
+    /// or corrupted buffer.
     pub fn new(buffer: &'a [Message<T>]) -> Self {
         if let Some(position) = buffer.iter().position(|x| x.state.load(Ordering::SeqCst).0) {
             let (_, seq_no) = buffer[position].state.load(Ordering::SeqCst);
@@ -354,14 +420,155 @@ impl<'a, T: Debug> Receiver<'a, T> {
                 position,
                 seq_no,
                 buffer,
+                recv_slot: T::default(),
             }
         } else {
             panic!("Uninitialized buffer!");
         }
     }
 
+    /// Blocking receive.
+    ///
+    /// Waits until the current readable slot is fully committed, copies
+    /// its payload into the internal receiver's area, and then verifies that
+    /// the slot has not been overwritten during the copy.
+    ///
+    /// On success, advances this receiver to the next message and returns:
+    ///
+    /// - the `seq_no` of the received message, and
+    /// - a stable reference to the payload.
+    ///
+    /// This method will spin-wait if the slot is still dirty.
     #[inline(always)]
-    pub unsafe fn recv_unsafe(&mut self) -> (u64, &T) {
+    pub fn recv(&mut self) -> (u64, &T) {
+        loop {
+            let seq_no = self.wait();
+            let slot = &self.buffer[self.position];
+            self.recv_slot.clone_from(&slot.payload);
+            let (_, seq_no2) = self.load_state();
+            if seq_no2 == seq_no {
+                self.position = self.position.wrapping_add(1) % BUFFER_LEN;
+                self.seq_no = seq_no.wrapping_add(1);
+                return (seq_no, &self.recv_slot);
+            }
+        }
+    }
+
+    /// Non-blocking receive.
+    ///
+    /// Attempts to read a payload from the current slot.
+    ///
+    /// Returns:
+    ///
+    /// - `(seq_no, Some(&T))` on success, after advancing to the next slot.
+    /// - `(seq_no, None)` if the slot is dirty or if it was overwritten while
+    ///   copying (detected by a changed `seq_no`). In this case, the receiver
+    ///   does **not** advance to the next slot.
+    #[inline(always)]
+    pub fn try_recv(&mut self) -> (u64, Option<&T>) {
+        let (dirty, seq_no) = self.load_state();
+        if !dirty {
+            let slot = &self.buffer[self.position];
+            self.recv_slot.clone_from(&(*slot.payload));
+            let (_, seq_no2) = self.load_state();
+            if seq_no2 == seq_no {
+                self.position = self.position.wrapping_add(1) % BUFFER_LEN;
+                self.seq_no = seq_no.wrapping_add(1);
+                (seq_no, Some(&self.recv_slot))
+            } else {
+                (seq_no2, None)
+            }
+        } else {
+            (seq_no, None)
+        }
+    }
+
+    /// Unsafely peeks at the current readable slot without copying.
+    ///
+    /// This returns a reference directly into the ring buffer, rather than
+    /// copying into receiver's area. Because the slot can be overwritten by the
+    /// sender, the returned reference is only valid as long as the slot is
+    /// not overwritten.
+    ///
+    /// Use this together with [`Receiver::advance`] to validate the peek:
+    ///
+    /// ```ignore
+    /// loop {
+    ///     let (seq_no, payload) = rx.peek_unsafe();
+    ///     // ... use `payload` speculatively ...
+    ///     if rx.advance() {
+    ///         // `payload` was not overwritten; work is valid.
+    ///         break;
+    ///     } else {
+    ///         // Slot may have been overwritten; roll back and retry.
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the reference is not used after the slot
+    /// has potentially been overwritten. In practice, you must call
+    /// [`Receiver::advance`] and check its return value before relying on
+    /// any work derived from `payload`.
+    #[inline(always)]
+    pub unsafe fn peek_unsafe(&mut self) -> (u64, &T) {
+        let seq_no = self.wait();
+        let slot = &self.buffer[self.position];
+        (seq_no, &slot.payload)
+    }
+
+    /// Non-blocking version of [`Receiver::peek_unsafe`].
+    ///
+    /// Returns:
+    ///
+    /// - `(seq_no, Some(&T))` if the slot is currently clean (committed).
+    /// - `(seq_no, None)` if the slot is dirty (still being written).
+    ///
+    /// # Safety
+    ///
+    /// Same caveats as [`Receiver::peek_unsafe`]: the returned reference
+    /// may be invalidated if the slot is overwritten, and must be validated
+    /// with [`Receiver::advance`].
+    #[inline(always)]
+    pub unsafe fn try_peek_unsafe(&mut self) -> (u64, Option<&T>) {
+        let (dirty, seq_no) = self.load_state();
+        let slot = &self.buffer[self.position];
+        if !dirty {
+            (seq_no, Some(&slot.payload))
+        } else {
+            (seq_no, None)
+        }
+    }
+
+    /// Attempts to advance the receiver past the current slot.
+    ///
+    /// This is intended to be used after a speculative peek (see
+    /// [`Receiver::peek_unsafe`]). It re-reads the state of the current slot
+    /// and checks whether the `seq_no` still matches `self.seq_no`.
+    ///
+    /// - If the `seq_no` matches, the slot has not been overwritten:
+    ///   - the receiver advances to the next slot, and
+    ///   - the method returns `true`.
+    ///
+    /// - If the `seq_no` differs, the slot was overwritten:
+    ///   - the receiver does **not** advance, and
+    ///   - the method returns `false`.
+    #[inline(always)]
+    pub fn advance(&mut self) -> bool {
+        let (_, seq_no) = self.load_state();
+        let valid = self.seq_no == seq_no;
+        self.position = self.position.wrapping_add(valid as usize) % BUFFER_LEN;
+        self.seq_no = seq_no.wrapping_add(valid as u64);
+        valid
+    }
+
+    /// Spin-waits until the current slot becomes clean (committed).
+    ///
+    /// This loops while the dirty flag is set, repeatedly loading the state.
+    /// Once the slot is clean, it returns the observed `seq_no`.
+    #[inline(always)]
+    pub fn wait(&self) -> u64 {
         // Spin-wait on `dirty` flag
         let slot = &self.buffer[self.position];
         let seq_no = loop {
@@ -371,11 +578,20 @@ impl<'a, T: Debug> Receiver<'a, T> {
             }
             // core::hint::spin_loop(); // Consider adding it. It adds asm instruction `pause`.
         };
+        seq_no
+    }
 
-        self.position = self.position.wrapping_add(1) % BUFFER_LEN;
-        self.seq_no = seq_no.wrapping_add(1);
-
-        (seq_no, &slot.payload)
+    /// Returns the current slot’s `(dirty, seq_no)` without blocking.
+    ///
+    /// This method performs a single atomic load of the slot state at the
+    /// receiver's current position. It does **not** spin-wait for the slot to
+    /// become clean; callers must handle the case where `dirty == true`.
+    ///
+    /// This is the non-blocking counterpart of [`Receiver::wait`].
+    #[inline(always)]
+    pub fn load_state(&self) -> (bool, u64) {
+        let slot = &self.buffer[self.position];
+        slot.state.load(Ordering::SeqCst)
     }
 }
 
