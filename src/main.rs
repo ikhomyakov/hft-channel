@@ -136,10 +136,24 @@ fn reader() -> io::Result<()> {
         // print!("{}      \r", trials.len());
         // io::stdout().flush().unwrap();
         let ts0 = rdtscp();
-        let (seq_no, ts1) = {
+
+        let (seq_no, ts1) = if true {
+            // This performs a full payload copy.
             let (seq_no, payload) = rx.recv();
             (seq_no, payload.timestamp)
+        } else {
+            // This avoids copying the payload by peeking directly into the slot.
+            // `peek_unsafe` returns a reference into the ring buffer, and `advance`
+            // confirms that the slot was not overwritten while reading it.
+            loop {
+                let (seq_no, payload) = unsafe { rx.peek_unsafe() };
+                let ts1 = payload.timestamp;
+                if rx.advance() {
+                    break (seq_no, ts1);
+                }
+            }
         };
+
         let ts2 = rdtscp();
         trials.push(ts2 - ts1);
         trials2.push(ts2 - ts0);
