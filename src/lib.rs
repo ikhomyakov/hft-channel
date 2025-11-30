@@ -60,8 +60,9 @@
 #[cfg(not(unix))]
 compile_error!("This crate only supports Unix-like operating systems.");
 
-mod ring_buffer;
+mod mmap;
+pub mod spmc_broadcast;
 mod utils;
 
-pub use ring_buffer::{Message, Receiver, Sender};
+pub(crate) use mmap::{map_shared_memory, unmap_shared_memory};
 pub use utils::{Trials, mono_time_ns};

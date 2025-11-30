@@ -1,5 +1,5 @@
 [package]
-name = "ichannel"
+name = "hft-channel"
 version = "0.1.0"
 edition = "2024"
 authors = ["IKH Software, Inc. <support@ikhsoftware.com>"]
