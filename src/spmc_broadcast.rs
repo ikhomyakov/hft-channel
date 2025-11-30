@@ -287,7 +287,7 @@ impl<T: Default> ShmBuffer<T> {
     fn try_new(capacity: usize, shm_name: &str) -> std::io::Result<Arc<Self>> {
         let capacity = capacity.max(2).next_power_of_two();
         let capacity_mask = capacity - 1;
-        let ptr = map_shared_memory(shm_name, capacity)?;
+        let ptr = map_shared_memory(shm_name, capacity * std::mem::size_of::<Message<T>>())?;
         Ok(Arc::new(Self {
             ptr: ptr.cast(),
             capacity,
