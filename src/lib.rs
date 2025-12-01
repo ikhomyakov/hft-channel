@@ -1,61 +1,75 @@
-//! # Ring Buffer
+//! # SPMC broadcast channel for HFT and real-time systems
 //!
-//! A lightweight, high-performance ring buffer designed for use in
-//! high-frequency trading (HFT) and other low-latency systems.
+//! A lightweight, ultra-low-latency **single-producer / multi-consumer**
+//! broadcast channel designed for **high-frequency trading (HFT)** and other
+//! real-time systems.
 //!
-//! This crate provides a single-producer, multi-receiver channel
-//! implementation with predictable performance characteristics,
-//! minimal contention, and carefully controlled memory access patterns.
+//! Provides predictable performance, minimal contention, and carefully
+//! controlled memory access patterns. Supports **thread-to-thread broadcasting**
+//! via local memory, or **inter-process communication** using shared memory.
 //!
-//! The ring buffer may be used for **intra-thread communication**
-//! (broadcasting messages between threads using local memory) or for
-//! **inter-process communication** when the backing memory region is
-//! placed in shared memory. In both cases, the design avoids locks
-//! and minimizes cache-line contention, making it suitable for
-//! latency-sensitive workloads.
+//! # Features
 //!
-//! ## Spin-Wait Behavior
+//! * **Lock-free** single-producer / multi-consumer broadcast channel  
+//! * **Seq_no protocol** for overwrite detection  
+//! * **Spin-wait receivers** for ultra-low latency  
+//! * **Cache-friendly** layout (CachePadded)  
+//! * Works **between threads** or **between processes** via shared memory  
+//! * Zero allocations after initialization  
+//! * `no_std`-friendly design  
 //!
-//! Please note that **receivers use spin-waiting** while observing the
-//! producer’s progress. A receiver continuously polls the `dirty` flag
-//! of its current slot until the writer commits the message.
+//! # Spin-Wait Behavior
 //!
-//! This design has several important implications:
+//! Receivers use **busy-waiting** (spin loops) to wait for the producer to
+//! complete publishing the next message.
 //!
-//! - **Ultra-low latency:**  
-//!   Spin-waiting avoids kernel scheduling and wake-up delays, making
-//!   message delivery effectively bounded by memory latency rather than
-//!   OS overhead.
+//! **Implications:**
 //!
-//! - **CPU usage:**  
-//!   A waiting receiver **consumes a full logical core** while spinning.
-//!   This is typically acceptable (and desirable) in HFT or real-time
-//!   systems, but it may not be suitable for general-purpose workloads.
+//! * **Lowest possible latency** (no OS scheduling)  
+//! * A receiver consumes **one logical CPU core** while waiting  
+//! * Best when producer and receivers are on the **same NUMA node**  
+//! * Not ideal when power efficiency is important  
+//! * No OS blocking (by design)  
 //!
-//! - **NUMA/cache sensitivity:**  
-//!   Because receivers poll a shared cache line, performance is best
-//!   when threads are placed on the same NUMA node as the producer.
+//! This design is intended for **HFT**, **trading engines**, **matching
+//! engines**, **real-time telemetry**, and other performance-critical
+//! workloads.
 //!
-//! - **No blocking primitives:**  
-//!   The implementation never parks threads or uses OS synchronization
-//!   primitives. This makes it ideal for low-latency pipelines, but
-//!   not for applications requiring power efficiency or fairness.
+//! # Example
 //!
-//! ## Modules
+//! ```rust
+//! use hft_channel::spmc_broadcast::channel;
 //!
-//! - [`ring_buffer`] — Core types (`Sender`, `Receiver`, `Message`) implementing
-//!   the lock-free ring-buffer protocol.
-//! - [`utils`] — Benchmarking and experimentation helpers.
+//! let (tx, rx) = channel::<u64>("/test", 512);
 //!
-//! ## License
+//! let (_, payload) = tx.reserve();
+//! *payload = 42;
+//! tx.commit();
 //!
-//! Copyright © 2005–2025  
-//! IKH Software, Inc.
+//! let (_, payload) = rx.recv();
+//! ```
 //!
-//! Licensed under the terms of the **GNU Lesser General Public License**,  
-//! version 3.0, or (at your option) any later version.  
+//! # Design Overview
 //!
-//! See <https://www.gnu.org/licenses/lgpl-3.0.html> for details.
+//! Each slot’s state is encoded as:
+//!
+//! ```text
+//! [ dirty (1 bit, MSB) | seq_no (63 bits) ]
+//! ```
+//!
+//! Guarantees:
+//!
+//! * At least **one slot is always dirty**  
+//! * Dirty slot = currently being written  
+//! * Clean slot = readable and stable  
+//! * If a receiver observes a changed `seq_no`, the slot was overwritten  
+//!
+//! Typical protocol:
+//!
+//! 1. Sender marks the **next reserved** slot dirty  
+//! 2. Sender writes the payload into the **current reserved** slot  
+//! 3. Sender clears the dirty flag (commit)  
+//! 4. Receiver waits for `dirty == false`, then reads or copies the payload  
 
 #[cfg(not(unix))]
 compile_error!("This crate only supports Unix-like operating systems.");

@@ -7,7 +7,7 @@ license = "LGPL-3.0-or-later"
 repository = "https://github.com/ikhomyakov/ichannel.git"
 keywords = ["hft", "low-latency", "real-time", "ring-buffer", "mpsc"]
 categories = ["concurrency", "data-structures", "memory-management"]
-description = "High-Performance Ring Buffer for HFT and real-time systems"
+description = "SPMC broadcast channel for HFT and real-time systems"
 readme = "README.md"
 
 [dependencies]

@@ -12,6 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Both the `Sender` and `Receiver` operate on the same underlying
 /// shared-memory buffer.
 ///
+/// The channel is defined for payload types `T` where `T: Copy + Clone`.  
+/// The `Copy` bound is required because payloads are stored
+/// directly in inter-process shared memory and must be trivially copyable.  
+///
 /// # Capacity
 ///
 /// The `capacity` parameter is rounded up to the next power of two,
@@ -26,16 +30,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// * it **must start with `'/'`**, e.g. `"/my-channel"`  
 /// * it must contain no other `'/'` characters  
 ///
-/// The corresponding shared-memory object will be created under
-/// **`/dev/shm`** (on Linux), using `shm_open`.  
-/// For example, a name `"/my-channel"` becomes:
-///
-/// ```text
-/// /dev/shm/my-channel
-/// ```
-///
 /// Attempting to create a region with a name that already exists will
-/// return an error.
+/// reuse the same region.
 ///
 /// # Parameters
 ///
@@ -44,18 +40,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// # Returns
 ///
-/// A `(Sender, Receiver)` pair that both reference the same shared
-/// memory region.
+/// A `(Sender, Receiver)` pair that both operate on the same shared-memory
+/// ring buffer.  
+///
+/// Both types are `Send` but not `Sync`, ensuring they may be moved between
+/// threads but cannot be shared concurrently across them.  
+///
+/// The `Receiver` is clonable, allowing multiple independent consumers that
+/// each maintain their own read position.  
+///
+/// The `Sender` is **not** clonable, preserving the single-producer
+/// invariant for the shared ring buffer.
 ///
 /// # Errors
 ///
 /// This function returns an error if:
 ///
-/// * the shared-memory object cannot be created under `/dev/shm`
+/// * the shared-memory object cannot be created
 /// * the name is invalid or does not begin with `'/'`
-/// * the region already exists
 /// * or any OS-level shared-memory operation fails
-pub fn channel<T: Clone + Default + Debug>(
+pub fn channel<T: Clone + Copy + Default + Debug>(
     shm_name: impl AsRef<str>,
     capacity: usize,
 ) -> std::io::Result<(Sender<T, ShmBuffer<T>>, Receiver<T, ShmBuffer<T>>)> {
@@ -75,7 +79,10 @@ pub fn channel<T: Clone + Default + Debug>(
 /// The resulting ring buffer capacity is always a power of two and
 /// is never smaller than 2, regardless of the input value. This rounding
 /// simplifies wrap-around operations inside the circular buffer.
-///
+/// 
+/// Unlike the shared-memory version, `T` does **not** need to implement
+/// `Copy`, since the buffer resides entirely within a single process.
+/// 
 /// # Parameters
 ///
 /// * `capacity` — Minimum requested capacity (rounded up to a power of two)
@@ -84,6 +91,16 @@ pub fn channel<T: Clone + Default + Debug>(
 ///
 /// A `(Sender, Receiver)` pair that both reference the same
 /// heap-allocated buffer.
+///
+/// Both types are `Send` but not `Sync`, ensuring they may be moved between
+/// threads but cannot be shared concurrently across them.  
+///
+/// The `Receiver` is clonable, allowing multiple independent consumers that
+/// each maintain their own read position.  
+///
+/// The `Sender` is **not** clonable, preserving the single-producer
+/// invariant for the shared ring buffer.
+
 pub fn local_channel<T: Clone + Default + Debug>(
     capacity: usize,
 ) -> (Sender<T, HeapBuffer<T>>, Receiver<T, HeapBuffer<T>>) {
@@ -91,7 +108,7 @@ pub fn local_channel<T: Clone + Default + Debug>(
     (Sender::new(buffer.clone()), Receiver::new(buffer))
 }
 
-/// A storage abstraction for the ring buffer used by the channel.
+/// A storage abstraction for the ring buffer used by the channels.
 ///
 /// Implementors provide access to per-slot `Message<T>` entries and
 /// define the effective capacity of the underlying buffer. Both
@@ -396,7 +413,7 @@ pub struct Message<T: Sized> {
     payload: CachePadded<T>,
 }
 
-/// Single-producer sender for a ring buffer.
+/// The channel’s sending handle, restricted to a single producer.
 ///
 /// This channel provides **no backpressure**: when the buffer becomes full,
 /// sending a new message will **overwrite the oldest message**. It is the
@@ -438,16 +455,14 @@ pub struct Message<T: Sized> {
 pub struct Sender<T, B: Buffer<T>> {
     /// Current monotonically increasing `seq_no`.
     ///
-    /// This is the sequence number associated with the **dirty slot** that
-    /// will be written by the next call to [`reserve`](Self::reserve).
+    /// The sequence number associated with the **dirty slot**—the slot that
+    /// the sender will write to next.
     ///
     /// That slot is located at:
     ///
     /// - `seq_no % capacity`  
     /// - or, more efficiently (since capacity is a power of two):
     ///   `seq_no & capacity_mask`
-    ///
-    /// The corresponding slot is marked dirty in its state.
     seq_no: Cell<u64>,
 
     /// Shared backing buffer for the ring.
@@ -518,18 +533,19 @@ impl<T: Clone + Default, B: Buffer<T>> Sender<T, B> {
         }
     }
 
-    /// Reserves the current dirty slot in the ring buffer for writing.
-    ///
+    /// Reserves a slot in the ring buffer for writing the payload.
+    /// 
     /// This is an HFT-style API:
     ///
     /// - No backpressure and no blocking.
     /// - Always returns a writable slot; it is the caller's responsibility
     /// to keep up and tolerate overwrites if necessary.
     ///
-    /// Returns the current `seq_no` and a mutable reference to the payload
-    /// stored at the dirty slot. The caller *must* eventually call [`Self::commit`]
-    /// to publish the data to consumers. Typically, the caller writes into the
-    /// returned `&mut T` and then invokes `commit` to publish the payload.
+    /// Returns the current `seq_no` and a mutable reference to the payload of
+    /// the next writable slot.
+    /// 
+    /// After `reserve`, the caller typically writes the payload and then
+    /// calls `commit`.
     ///
     /// # Returns
     ///
@@ -540,44 +556,26 @@ impl<T: Clone + Default, B: Buffer<T>> Sender<T, B> {
     ///
     /// # Notes
     ///
-    /// This call is effectively a no‑op because the sender keeps the dirty
-    /// slot ready for writing at all times. The operation merely exposes the
-    /// already-reserved slot rather than performing any additional state
-    /// transitions.
+    /// This call is effectively a no-op, as the sender always maintains a
+    /// reserved slot ready for writing. It simply exposes that slot without
+    /// performing any state transitions, so calling `reserve` repeatedly—or
+    /// even without a matching `commit`—is harmless.
     #[inline(always)]
     pub fn reserve(&self) -> (u64, &mut T) {
         let seq_no = self.seq_no.get();
         unsafe { (seq_no, &mut self.buffer.slot_mut(seq_no).payload) }
     }
 
-    /// Commits (publishes) the current slot and advances to the next one.
+    /// Commits (publishes) the reserved slot.
     ///
-    /// This finalizes and publishes the payload that currently resides in
-    /// the slot associated with the current `seq_no`. The method does **not**
-    /// inspect or assume how the payload got there; it only flips the state
-    /// bits and advances the sequence number.
+    /// This finalizes and publishes the payload that was writtent into the
+    /// reserved slot.
     ///
-    /// ## Calling Without `reserve`
-    ///
-    /// It is **fully valid** to call `commit()` without a preceding call to
-    /// [`Self::reserve`]:
-    ///
-    /// - No write occurs.  
-    /// - Whatever value is already present in the current slot is published
-    ///   as-is.
-    ///
-    /// This is semantically equivalent to:
+    /// Calling `commit` without `reserve` is safe and semantically equivalent to:
     ///
     /// 1. Calling `reserve()`.  
     /// 2. Performing **no writes** to the returned `&mut T`.  
     /// 3. Calling `commit()`.
-    ///
-    /// ## Behavior after publishing
-    ///
-    /// - The **next slot** (for `next_seq_no`) becomes the new dirty slot and
-    ///   the target for the next `reserve()`.
-    /// - The **current slot** (for the old `seq_no`) becomes clean and its
-    ///   payload is ready for consumption.  
     #[inline(always)]
     pub fn commit(&self) {
         let seq_no = self.seq_no.get();
@@ -641,14 +639,14 @@ impl<T: Clone + Default, B: Buffer<T>> Sender<T, B> {
     }
 }
 
-/// Multi-receiver handle for reading from a ring buffer.
+/// The channel’s receiving handle, allowing multiple independent consumers.
 ///
 /// A `Receiver`:
 ///
 /// - never mutates the structure of the ring buffer,
 /// - maintains its own independent read position (`seq_no`),
 /// - can run concurrently with other receivers, and
-/// - holds a private `recv_payload` used to return stable references.
+/// - holds a private payload element used to return stable references .
 ///
 /// Each receiver may lag behind the sender. If the sender wraps around and
 /// overwrites the receiver’s target slot, the receiver detects this via a
@@ -664,8 +662,8 @@ impl<T: Clone + Default, B: Buffer<T>> Sender<T, B> {
 /// After copying the payload out of a readable slot, the receiver must verify
 /// that the slot’s `seq_no` is unchanged.  
 ///
-/// - If `seq_no` unchanged → the payload is valid.  
-/// - If `seq_no` changed   → the slot was overwritten; the payload must be
+/// - If `seq_no` unchanged, then the payload is valid.  
+/// - If `seq_no` changed, then the slot was overwritten and the payload must be
 ///   discarded.
 ///
 /// Because each receiver tracks its own `seq_no`, different receivers may
@@ -674,7 +672,8 @@ impl<T: Clone + Default, B: Buffer<T>> Sender<T, B> {
 /// # Overwrite Detection
 ///
 /// If a receiver falls behind and attempts to read a slot that was already
-/// overwritten, the `seq_no` comparison reliably detects the loss.  
+/// overwritten, the `seq_no` comparison reliably detects the loss.
+///  
 /// The receiver can then:
 ///
 /// - discard the payload,  

@@ -7,6 +7,7 @@ pub(crate) fn map_shared_memory(
     let addr = unsafe {
         let shared_memory_name = std::ffi::CString::new(shared_memory_name).unwrap();
 
+        dbg!("shm_open");
         let fd = libc::shm_open(
             shared_memory_name.as_ptr(),
             libc::O_CREAT | libc::O_RDWR,
@@ -16,12 +17,14 @@ pub(crate) fn map_shared_memory(
             return Err(std::io::Error::last_os_error());
         }
 
+        dbg!("ftruncate");
         if libc::ftruncate(fd, size as libc::off_t) == -1 {
             let err = std::io::Error::last_os_error();
             libc::close(fd);
             return Err(err);
         }
 
+        dbg!("mmap");
         let addr = libc::mmap(
             std::ptr::null_mut(),
             size,

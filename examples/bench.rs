@@ -1,4 +1,4 @@
-use hft_channel::{Trials, mono_time_ns, spmc_broadcast::channel};
+use hft_channel::{Trials, mono_time_ns, spmc_broadcast::{channel, local_channel}};
 
 #[cfg(not(unix))]
 compile_error!("This crate only supports Unix-like operating systems.");
@@ -8,7 +8,7 @@ const PAYLOAD_SIZE: usize = 248;
 const TRIALS: usize = 100_000;
 
 /// Example payload type used in each ring-buffer slot (wrapped in a `Message`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct Payload<const N: usize> {
     pub timestamp: u64,
@@ -24,18 +24,34 @@ impl<const N: usize> Default for Payload<N> {
     }
 }
 
+
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} writer|reader", args[0]);
+        eprintln!("Usage: {} writer|reader|both", args[0]);
         std::process::exit(1);
     }
 
     match args[1].as_str() {
         "writer" => writer(),
         "reader" => reader(),
+        "both" => {
+            let (tx, rx) = local_channel::<Vec<u8>>(2);
+            tx.send(vec![1, 2, 3]);
+            let (seq_no, vs) = unsafe { rx.peek_unsafe() };
+            tx.send(vec![2, 3, 4]);
+            tx.send(vec![3, 4, 5]);
+            dbg!(seq_no);
+            dbg!(&vs);
+            dbg!(rx.advance());
+            dbg!(rx.wait());
+            dbg!(rx.wait());
+            dbg!(rx.advance());
+            dbg!(rx.wait());
+            Ok(())
+        }
         _ => {
-            eprintln!("Usage: {} writer|reader", args[0]);
+            eprintln!("Usage: {} writer|reader|both", args[0]);
             std::process::exit(1);
         }
     }
@@ -48,7 +64,7 @@ fn writer() -> std::io::Result<()> {
 
     let mut payload = Payload::<PAYLOAD_SIZE>::default();
 
-    let (tx, _) = channel("/test", BUFFER_LEN)?;    
+    let (tx, _) = channel("/test1", BUFFER_LEN)?;
 
     loop {
         let ts0 = mono_time_ns();
@@ -76,7 +92,7 @@ fn reader() -> std::io::Result<()> {
     let mut trials = Trials::with_capacity(TRIALS);
     let mut trials2 = Trials::with_capacity(TRIALS);
 
-    let (_, mut rx) = channel::<Payload<PAYLOAD_SIZE>>("/test", BUFFER_LEN)?;
+    let (_, mut rx) = channel::<Payload<PAYLOAD_SIZE>>("/test1", BUFFER_LEN)?;
 
     let mut prev_seq_no: u64 = 0;
     loop {
