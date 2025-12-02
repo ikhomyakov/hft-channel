@@ -59,7 +59,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// * the shared-memory object cannot be created
 /// * the name is invalid or does not begin with `'/'`
 /// * or any OS-level shared-memory operation fails
-pub fn channel<T: Clone + Copy + Default + Debug>(
+pub fn channel<T: Clone + Copy + Default + Debug + Send + 'static>(
     shm_name: impl AsRef<str>,
     capacity: usize,
 ) -> std::io::Result<(Sender<T, ShmBuffer<T>>, Receiver<T, ShmBuffer<T>>)> {
@@ -79,10 +79,10 @@ pub fn channel<T: Clone + Copy + Default + Debug>(
 /// The resulting ring buffer capacity is always a power of two and
 /// is never smaller than 2, regardless of the input value. This rounding
 /// simplifies wrap-around operations inside the circular buffer.
-/// 
+///
 /// Unlike the shared-memory version, `T` does **not** need to implement
 /// `Copy`, since the buffer resides entirely within a single process.
-/// 
+///
 /// # Parameters
 ///
 /// * `capacity` — Minimum requested capacity (rounded up to a power of two)
@@ -101,7 +101,7 @@ pub fn channel<T: Clone + Copy + Default + Debug>(
 /// The `Sender` is **not** clonable, preserving the single-producer
 /// invariant for the shared ring buffer.
 
-pub fn local_channel<T: Clone + Default + Debug>(
+pub fn local_channel<T: Clone + Default + Debug + Send>(
     capacity: usize,
 ) -> (Sender<T, HeapBuffer<T>>, Receiver<T, HeapBuffer<T>>) {
     let buffer = HeapBuffer::new(capacity);
@@ -369,6 +369,7 @@ impl State {
     ///
     /// `seq_no` must fit in the low 63 bits; in debug builds this is checked
     /// with a `debug_assert!`.
+    #[inline(always)]
     fn new(dirty: bool, seq_no: u64) -> Self {
         debug_assert!(seq_no < DIRTY_MASK);
         Self(AtomicU64::new(seq_no | ((dirty as u64) << DIRTY_BIT)))
@@ -471,7 +472,7 @@ pub struct Sender<T, B: Buffer<T>> {
     _marker: std::marker::PhantomData<T>,
 }
 
-impl<T: Clone + Default, B: Buffer<T>> Sender<T, B> {
+impl<T: Clone + Default + Send, B: Buffer<T>> Sender<T, B> {
     /// Constructs a sender from an existing ring buffer.
     ///
     /// If the buffer already contains a dirty slot with a non-zero `seq_no`,
@@ -534,7 +535,7 @@ impl<T: Clone + Default, B: Buffer<T>> Sender<T, B> {
     }
 
     /// Reserves a slot in the ring buffer for writing the payload.
-    /// 
+    ///
     /// This is an HFT-style API:
     ///
     /// - No backpressure and no blocking.
@@ -543,7 +544,7 @@ impl<T: Clone + Default, B: Buffer<T>> Sender<T, B> {
     ///
     /// Returns the current `seq_no` and a mutable reference to the payload of
     /// the next writable slot.
-    /// 
+    ///
     /// After `reserve`, the caller typically writes the payload and then
     /// calls `commit`.
     ///

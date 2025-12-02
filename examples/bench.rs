@@ -1,4 +1,8 @@
-use hft_channel::{Trials, mono_time_ns, spmc_broadcast::{channel, local_channel}};
+use hft_channel::{
+    Trials, mono_time_ns,
+    spmc_broadcast::{Message, channel, local_channel},
+};
+use crossbeam_utils::CachePadded;
 
 #[cfg(not(unix))]
 compile_error!("This crate only supports Unix-like operating systems.");
@@ -24,13 +28,21 @@ impl<const N: usize> Default for Payload<N> {
     }
 }
 
-
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: {} writer|reader|both", args[0]);
         std::process::exit(1);
     }
+
+    println!(
+        "Message size: {}, payload size: {}, cache padded payload size: {}, buffer length: {}, buffer size: {}",
+        std::mem::size_of::<Message<Payload<PAYLOAD_SIZE>>>(),
+        std::mem::size_of::<Payload<PAYLOAD_SIZE>>(),
+        std::mem::size_of::<CachePadded<Payload<PAYLOAD_SIZE>>>(),
+        BUFFER_LEN,
+        std::mem::size_of::<Message<Payload<PAYLOAD_SIZE>>>() * BUFFER_LEN
+    );
 
     match args[1].as_str() {
         "writer" => writer(),
@@ -98,11 +110,8 @@ fn reader() -> std::io::Result<()> {
     loop {
         let ts0 = mono_time_ns();
 
-        let (seq_no, ts1) = if true {
+        let (seq_no, ts1) = if false {
             // This path performs a full payload copy.
-            // In practice, the optimizer will only copy the bytes that are actually
-            // used. In this example, only the `timestamp` field (8 bytes) is copied
-            // out of the payload, not the entire payload buffer.
             let (seq_no, payload) = rx.recv();
             (seq_no, payload.timestamp)
         } else {
