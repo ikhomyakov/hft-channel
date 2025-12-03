@@ -1,8 +1,8 @@
+use crossbeam_utils::CachePadded;
 use hft_channel::{
     Trials, mono_time_ns,
-    spmc_broadcast::{Message, channel, local_channel},
+    spmc_broadcast::{Buffer, Message, Receiver, Sender, channel, local_channel},
 };
-use crossbeam_utils::CachePadded;
 
 #[cfg(not(unix))]
 compile_error!("This crate only supports Unix-like operating systems.");
@@ -45,21 +45,49 @@ fn main() -> std::io::Result<()> {
     );
 
     match args[1].as_str() {
-        "writer" => writer(),
-        "reader" => reader(),
+        "writer" => {
+            let (tx, _) = channel("/test1", BUFFER_LEN)?;
+            writer(tx)
+        }
+        "reader" => {
+            let (_, rx) = channel::<Payload<PAYLOAD_SIZE>>("/test1", BUFFER_LEN)?;
+            reader(rx)
+        }
         "both" => {
-            let (tx, rx) = local_channel::<Vec<u8>>(2);
-            tx.send(vec![1, 2, 3]);
-            let (seq_no, vs) = unsafe { rx.peek_unsafe() };
-            tx.send(vec![2, 3, 4]);
-            tx.send(vec![3, 4, 5]);
-            dbg!(seq_no);
-            dbg!(&vs);
-            dbg!(rx.advance());
-            dbg!(rx.wait());
-            dbg!(rx.wait());
-            dbg!(rx.advance());
-            dbg!(rx.wait());
+            let (tx, rx) = local_channel::<Payload<PAYLOAD_SIZE>>(BUFFER_LEN);
+
+            let cores = core_affinity::get_core_ids().unwrap();
+            dbg!(&cores);
+            assert!(
+                cores.len() > 1,
+                "At least 2 CPU cores are required (found {}).",
+                cores.len()
+            );
+
+            let readers: Vec<_> = (2..cores.len().min(2 + 2))
+                .map(|i| {
+                    let rx = rx.clone();
+                    let core_id = cores[i].clone();
+                    std::thread::spawn(move || {
+                        core_affinity::set_for_current(core_id);
+                        reader(rx)
+                    })
+                })
+                .collect();
+            
+            let core_id = cores[1].clone();
+            let writer = std::thread::spawn(move || {
+                core_affinity::set_for_current(core_id);
+                writer(tx)
+            });
+
+            readers
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<std::io::Result<Vec<_>>>()?;
+
+            writer.join().unwrap()?;
+
             Ok(())
         }
         _ => {
@@ -70,13 +98,13 @@ fn main() -> std::io::Result<()> {
 }
 
 #[inline(never)]
-fn writer() -> std::io::Result<()> {
+fn writer(
+    tx: Sender<Payload<PAYLOAD_SIZE>, impl Buffer<Payload<PAYLOAD_SIZE>>>,
+) -> std::io::Result<()> {
     let mut trials = Trials::with_capacity(TRIALS);
     let mut trials2 = Trials::with_capacity(TRIALS);
 
     let mut payload = Payload::<PAYLOAD_SIZE>::default();
-
-    let (tx, _) = channel("/test1", BUFFER_LEN)?;
 
     loop {
         let ts0 = mono_time_ns();
@@ -100,11 +128,11 @@ fn writer() -> std::io::Result<()> {
 }
 
 #[inline(never)]
-fn reader() -> std::io::Result<()> {
+fn reader(
+    mut rx: Receiver<Payload<PAYLOAD_SIZE>, impl Buffer<Payload<PAYLOAD_SIZE>>>,
+) -> std::io::Result<()> {
     let mut trials = Trials::with_capacity(TRIALS);
     let mut trials2 = Trials::with_capacity(TRIALS);
-
-    let (_, mut rx) = channel::<Payload<PAYLOAD_SIZE>>("/test1", BUFFER_LEN)?;
 
     let mut prev_seq_no: u64 = 0;
     loop {

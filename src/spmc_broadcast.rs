@@ -171,6 +171,9 @@ pub struct HeapBuffer<T> {
     capacity_mask: usize,
 }
 
+unsafe impl<T: Send> Send for HeapBuffer<T> {}
+unsafe impl<T: Send> Sync for HeapBuffer<T> {}
+
 impl<T> Buffer<T> for HeapBuffer<T> {
     #[inline(always)]
     fn capacity(&self) -> usize {
@@ -252,6 +255,9 @@ pub struct ShmBuffer<T> {
     capacity: usize,
     capacity_mask: usize,
 }
+
+unsafe impl<T: Send> Send for ShmBuffer<T> {}
+unsafe impl<T: Send> Sync for ShmBuffer<T> {}
 
 impl<T> Buffer<T> for ShmBuffer<T> {
     #[inline(always)]
@@ -680,7 +686,7 @@ impl<T: Clone + Default + Send, B: Buffer<T>> Sender<T, B> {
 /// - discard the payload,  
 /// - resynchronize to the new sequence number,  
 /// - and continue receiving.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Receiver<T, B: Buffer<T>> {
     /// The receiver's current `seq_no`, i.e. the `seq_no` of expected message.
     seq_no: Cell<u64>,
@@ -904,6 +910,17 @@ impl<T: Clone + Default + Debug, B: Buffer<T>> Receiver<T, B> {
     #[inline(always)]
     fn load_state(&self, seq_no: u64) -> (bool, u64) {
         unsafe { self.buffer.slot(seq_no).state.load(Ordering::SeqCst) }
+    }
+}
+
+impl<T: Clone, B: Buffer<T>> Clone for Receiver<T, B> {
+    fn clone(&self) -> Self {
+        Self {
+            seq_no: self.seq_no.clone(),
+            buffer: Arc::clone(&self.buffer),
+            recv_payload: self.recv_payload.clone(),
+            _marker: std::marker::PhantomData,
+        }
     }
 }
 

@@ -13,3 +13,6 @@ readme = "README.md"
 [dependencies]
 crossbeam-utils = "0.8.21"
 libc = "0.2.177"
+
+[dev-dependencies]
+core_affinity = "0.8.3"
