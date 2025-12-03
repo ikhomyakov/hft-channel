@@ -1,8 +1,18 @@
 [package]
-name = "ichannel"
+name = "hft-channel"
 version = "0.1.0"
 edition = "2024"
+authors = ["IKH Software, Inc. <support@ikhsoftware.com>"]
+license = "LGPL-3.0-or-later"
+repository = "https://github.com/ikhomyakov/ichannel.git"
+keywords = ["hft", "low-latency", "real-time", "ring-buffer", "mpsc"]
+categories = ["concurrency", "data-structures", "memory-management"]
+description = "SPMC broadcast channel for HFT and real-time systems"
+readme = "README.md"
 
 [dependencies]
 crossbeam-utils = "0.8.21"
 libc = "0.2.177"
+
+[dev-dependencies]
+core_affinity = "0.8.3"
