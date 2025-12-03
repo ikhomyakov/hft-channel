@@ -60,7 +60,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// * the shared-memory object cannot be created
 /// * the name is invalid or does not begin with `'/'`
 /// * or any OS-level shared-memory operation fails
-pub fn channel<T: Clone + Copy + Default + Debug + Send + 'static>(
+pub fn channel<T: Clone + Copy + Default + Send + 'static>(
     shm_name: impl AsRef<str>,
     capacity: usize,
 ) -> std::io::Result<(Sender<T, ShmBuffer<T>>, Receiver<T, ShmBuffer<T>>)> {
@@ -102,7 +102,7 @@ pub fn channel<T: Clone + Copy + Default + Debug + Send + 'static>(
 /// The `Sender` is **not** clonable, preserving the single-producer
 /// invariant for the shared ring buffer.
 
-pub fn local_channel<T: Clone + Default + Debug + Send>(
+pub fn local_channel<T: Clone + Default + Send>(
     capacity: usize,
 ) -> (Sender<T, HeapBuffer<T>>, Receiver<T, HeapBuffer<T>>) {
     let buffer = HeapBuffer::new(capacity);
@@ -709,7 +709,7 @@ pub struct Receiver<T, B: Buffer<T>> {
     _marker: PhantomData<T>,
 }
 
-impl<T: Clone + Default + Debug, B: Buffer<T>> Receiver<T, B> {
+impl<T: Clone + Default, B: Buffer<T>> Receiver<T, B> {
     /// Constructs a receiver positioned at the current dirty slot.
     ///
     /// This scans the buffer for the slot currently marked dirty

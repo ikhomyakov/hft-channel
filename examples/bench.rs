@@ -50,6 +50,7 @@ fn main() -> std::io::Result<()> {
     match args[1].as_str() {
         "writer" => {
             let (tx, _) = channel("/test-reader-writer", BUFFER_LEN)?;
+            dbg!(&tx);
             writer(tx)
         }
         "reader" => {
