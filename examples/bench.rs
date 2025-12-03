@@ -4,6 +4,12 @@ use hft_channel::{
     Trials, mono_time_ns,
     spmc_broadcast::{Buffer, Message, Receiver, Sender, channel, local_channel},
 };
+use std::io::Write;
+use std::{
+    fs::{File, OpenOptions},
+    io::BufWriter,
+    path::PathBuf,
+};
 
 #[cfg(not(unix))]
 compile_error!("This crate only supports Unix-like operating systems.");
@@ -102,6 +108,17 @@ enum Commands {
         #[arg(short = 'p', long = "period", default_value_t = 0)]
         period: u64,
     },
+
+    /// Receives messages from a shared-memory channel and saves them to a file.
+    Logger {
+        /// Input shared-memory segment name, which must begin with ‘/’.
+        #[arg(short = 'i', long = "input", default_value = "test-reader-writer")]
+        input: String,
+
+        /// Input shared-memory segment name, which must begin with ‘/’.
+        #[arg(short = 'f', long = "file")]
+        path: PathBuf,
+    },
 }
 
 fn main() -> std::io::Result<()> {
@@ -128,6 +145,15 @@ fn main() -> std::io::Result<()> {
             println!("input: {:?}", input);
             let (_, rx) = channel(&input, BUFFER_LEN)?;
             reader(rx)
+        }
+
+        Commands::Logger { input, path } => {
+            println!("input: {:?}, output file: {:?}", input, path);
+            let (_, rx) = channel(&input, BUFFER_LEN)?;
+            let file = OpenOptions::new().create(true).append(true).open(&path)?;
+            let writer = BufWriter::with_capacity(2 << 20, file);
+
+            logger(rx, writer)
         }
 
         Commands::Client {
@@ -357,7 +383,7 @@ fn reader(
         let ts2 = mono_time_ns();
         trials.push(ts2 - ts1);
         trials2.push(ts2 - ts0);
-        if prev_seq_no != 0 && prev_seq_no.wrapping_add(1) != seq_no {
+        if prev_seq_no.wrapping_add(1) != seq_no {
             println!(
                 "Skipped {} messages: prev seq_no {}, curr seq_no {}",
                 seq_no - prev_seq_no,
@@ -375,6 +401,60 @@ fn reader(
     trials2.sort();
     trials.print_csv("B");
     trials2.print_csv("C");
+
+    Ok(())
+}
+
+fn as_bytes<T: Sized>(p: &T) -> &[u8] {
+    unsafe { std::slice::from_raw_parts((p as *const T) as *const u8, std::mem::size_of::<T>()) }
+}
+
+#[inline(never)]
+fn logger(
+    mut rx: Receiver<Payload<PAYLOAD_SIZE>, impl Buffer<Payload<PAYLOAD_SIZE>>>,
+    mut writer: BufWriter<File>,
+) -> std::io::Result<()> {
+    let mut trials = Trials::with_capacity(TRIALS);
+    let mut trials2 = Trials::with_capacity(TRIALS);
+    let mut trials3 = Trials::with_capacity(TRIALS);
+
+    let mut prev_seq_no: u64 = 0;
+    loop {
+        let ts0 = mono_time_ns();
+        
+        let (seq_no, payload) = rx.recv();
+        let ts1 = payload.timestamp;
+
+        let ts2 = mono_time_ns();
+
+        writer.write_all(as_bytes(payload))?;
+
+        let ts3 = mono_time_ns();
+
+        trials.push(ts2 - ts1);
+        trials2.push(ts2 - ts0);
+        trials3.push(ts3 - ts2);
+
+        if prev_seq_no.wrapping_add(1) != seq_no {
+            println!(
+                "Skipped {} messages: prev seq_no {}, curr seq_no {}",
+                seq_no - prev_seq_no,
+                prev_seq_no,
+                seq_no
+            );
+        }
+        prev_seq_no = seq_no;
+        if trials.len() == TRIALS {
+            break;
+        }
+    }
+
+    trials.sort();
+    trials2.sort();
+    trials3.sort();
+    trials.print_csv("B");
+    trials2.print_csv("C");
+    trials3.print_csv("W");
 
     Ok(())
 }
