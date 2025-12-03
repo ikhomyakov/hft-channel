@@ -8,7 +8,7 @@ use hft_channel::{
 compile_error!("This crate only supports Unix-like operating systems.");
 
 const BUFFER_LEN: usize = 4096;
-const PAYLOAD_SIZE: usize = 248;
+const PAYLOAD_SIZE: usize = 400;
 const TRIALS: usize = 100_000;
 
 /// Example payload type used in each ring-buffer slot (wrapped in a `Message`).
@@ -49,25 +49,25 @@ fn main() -> std::io::Result<()> {
 
     match args[1].as_str() {
         "writer" => {
-            let (tx, _) = channel("/test1", BUFFER_LEN)?;
+            let (tx, _) = channel("/test-reader-writer", BUFFER_LEN)?;
             writer(tx)
         }
         "reader" => {
-            let (_, rx) = channel::<Payload<PAYLOAD_SIZE>>("/test1", BUFFER_LEN)?;
+            let (_, rx) = channel("/test-reader-writer", BUFFER_LEN)?;
             reader(rx)
         }
         "client" => {
-            let (tx1, _) = channel::<Payload<PAYLOAD_SIZE>>("/test1", BUFFER_LEN)?;
-            let (_, rx2) = channel::<Payload<PAYLOAD_SIZE>>("/test2", BUFFER_LEN)?;
+            let (tx1, _) = channel("/test-client-server", BUFFER_LEN)?;
+            let (_, rx2) = channel("/test-server-client", BUFFER_LEN)?;
             client(tx1, rx2)
         }
         "server" => {
-            let (_, rx1) = channel::<Payload<PAYLOAD_SIZE>>("/test1", BUFFER_LEN)?;
-            let (tx2, _) = channel::<Payload<PAYLOAD_SIZE>>("/test2", BUFFER_LEN)?;
-            client(tx2, rx1)
+            let (_, rx1) = channel("/test-client-server", BUFFER_LEN)?;
+            let (tx2, _) = channel("/test-server-client", BUFFER_LEN)?;
+            server(tx2, rx1)
         }
         "broadcast" => {
-            let (tx, rx) = local_channel::<Payload<PAYLOAD_SIZE>>(BUFFER_LEN);
+            let (tx, rx) = local_channel(BUFFER_LEN);
 
             let cores = core_affinity::get_core_ids().unwrap();
             assert!(
@@ -116,8 +116,8 @@ fn main() -> std::io::Result<()> {
             Ok(())
         }
         "ping" => {
-            let (tx1, rx1) = local_channel::<Payload<PAYLOAD_SIZE>>(BUFFER_LEN);
-            let (tx2, rx2) = local_channel::<Payload<PAYLOAD_SIZE>>(BUFFER_LEN);
+            let (tx1, rx1) = local_channel(BUFFER_LEN);
+            let (tx2, rx2) = local_channel(BUFFER_LEN);
 
             let cores = core_affinity::get_core_ids().unwrap();
             assert!(
