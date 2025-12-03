@@ -474,7 +474,7 @@ pub struct Sender<T, B: Buffer<T>> {
     /// - `seq_no % capacity`  
     /// - or, more efficiently (since capacity is a power of two):
     ///   `seq_no & capacity_mask`
-    seq_no: Cell<u64>,
+    seq_no: Cell<u64>, // Provides interior mutability and intentionally makes Receiver !Sync
 
     /// Shared backing buffer for the ring.
     buffer: Arc<B>,
@@ -693,7 +693,7 @@ impl<T: Clone + Default + Send, B: Buffer<T>> Sender<T, B> {
 #[derive(Debug)]
 pub struct Receiver<T, B: Buffer<T>> {
     /// The receiver's current `seq_no`, i.e. the `seq_no` of expected message.
-    seq_no: Cell<u64>,
+    seq_no: Cell<u64>, // Provides interior mutability and intentionally makes Receiver !Sync
 
     /// Shared backing buffer for the ring.
     buffer: Arc<B>,
