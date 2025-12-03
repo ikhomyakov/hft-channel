@@ -14,7 +14,7 @@ use std::{
 #[cfg(not(unix))]
 compile_error!("This crate only supports Unix-like operating systems.");
 
-const BUFFER_LEN: usize = 4096;
+const BUFFER_LEN: usize = 1 << 16;
 const PAYLOAD_SIZE: usize = 392;
 const TRIALS: usize = 100_000;
 
@@ -151,7 +151,7 @@ fn main() -> std::io::Result<()> {
             println!("input: {:?}, output file: {:?}", input, path);
             let (_, rx) = channel(&input, BUFFER_LEN)?;
             let file = OpenOptions::new().create(true).append(true).open(&path)?;
-            let writer = BufWriter::with_capacity(2 << 20, file);
+            let writer = BufWriter::with_capacity(1 << 20, file);
 
             logger(rx, writer)
         }
@@ -383,7 +383,7 @@ fn reader(
         let ts2 = mono_time_ns();
         trials.push(ts2 - ts1);
         trials2.push(ts2 - ts0);
-        if prev_seq_no.wrapping_add(1) != seq_no {
+        if prev_seq_no != 0 && prev_seq_no.wrapping_add(1) != seq_no {
             println!(
                 "Skipped {} messages: prev seq_no {}, curr seq_no {}",
                 seq_no - prev_seq_no,
@@ -435,7 +435,7 @@ fn logger(
         trials2.push(ts2 - ts0);
         trials3.push(ts3 - ts2);
 
-        if prev_seq_no.wrapping_add(1) != seq_no {
+        if prev_seq_no != 0 && prev_seq_no.wrapping_add(1) != seq_no {
             println!(
                 "Skipped {} messages: prev seq_no {}, curr seq_no {}",
                 seq_no - prev_seq_no,
