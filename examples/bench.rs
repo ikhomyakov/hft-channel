@@ -31,7 +31,10 @@ impl<const N: usize> Default for Payload<N> {
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} writer|reader|both [max_readers]", args[0]);
+        eprintln!(
+            "Usage: {} writer|reader|client|server|ping|broadcast [max_readers]",
+            args[0]
+        );
         std::process::exit(1);
     }
 
@@ -53,7 +56,17 @@ fn main() -> std::io::Result<()> {
             let (_, rx) = channel::<Payload<PAYLOAD_SIZE>>("/test1", BUFFER_LEN)?;
             reader(rx)
         }
-        "both" => {
+        "client" => {
+            let (tx1, _) = channel::<Payload<PAYLOAD_SIZE>>("/test1", BUFFER_LEN)?;
+            let (_, rx2) = channel::<Payload<PAYLOAD_SIZE>>("/test2", BUFFER_LEN)?;
+            client(tx1, rx2)
+        }
+        "server" => {
+            let (_, rx1) = channel::<Payload<PAYLOAD_SIZE>>("/test1", BUFFER_LEN)?;
+            let (tx2, _) = channel::<Payload<PAYLOAD_SIZE>>("/test2", BUFFER_LEN)?;
+            client(tx2, rx1)
+        }
+        "broadcast" => {
             let (tx, rx) = local_channel::<Payload<PAYLOAD_SIZE>>(BUFFER_LEN);
 
             let cores = core_affinity::get_core_ids().unwrap();
@@ -102,10 +115,79 @@ fn main() -> std::io::Result<()> {
 
             Ok(())
         }
+        "ping" => {
+            let (tx1, rx1) = local_channel::<Payload<PAYLOAD_SIZE>>(BUFFER_LEN);
+            let (tx2, rx2) = local_channel::<Payload<PAYLOAD_SIZE>>(BUFFER_LEN);
+
+            let cores = core_affinity::get_core_ids().unwrap();
+            assert!(
+                cores.len() > 2,
+                "At least 3 CPU cores are required (found {}).",
+                cores.len()
+            );
+
+            let core_id = cores[1].clone();
+            let _ = std::thread::spawn(move || {
+                core_affinity::set_for_current(core_id);
+                server(tx2, rx1)
+            });
+
+            let core_id = cores[2].clone();
+            let client = std::thread::spawn(move || {
+                core_affinity::set_for_current(core_id);
+                client(tx1, rx2)
+            });
+
+            client.join().unwrap()?;
+
+            Ok(())
+        }
         _ => {
-            eprintln!("Usage: {} writer|reader|both [max_readers]", args[0]);
+            eprintln!(
+                "Usage: {} writer|reader|client|server|ping|broadcast [max_readers]",
+                args[0]
+            );
             std::process::exit(1);
         }
+    }
+}
+
+#[inline(never)]
+fn client(
+    tx: Sender<Payload<PAYLOAD_SIZE>, impl Buffer<Payload<PAYLOAD_SIZE>>>,
+    mut rx: Receiver<Payload<PAYLOAD_SIZE>, impl Buffer<Payload<PAYLOAD_SIZE>>>,
+) -> std::io::Result<()> {
+    let mut trials = Trials::with_capacity(TRIALS);
+
+    let mut payload = Payload::<PAYLOAD_SIZE>::default();
+
+    loop {
+        let ts0 = mono_time_ns();
+        payload.timestamp = ts0;
+        tx.send_from(&payload);
+        let (_, payload) = rx.recv();
+        let ts1 = payload.timestamp;
+        let ts2 = mono_time_ns();
+        trials.push(ts2 - ts1);
+        if trials.len() == TRIALS {
+            break;
+        }
+    }
+
+    trials.sort();
+    trials.print_csv("D");
+
+    Ok(())
+}
+
+#[inline(never)]
+fn server(
+    tx: Sender<Payload<PAYLOAD_SIZE>, impl Buffer<Payload<PAYLOAD_SIZE>>>,
+    mut rx: Receiver<Payload<PAYLOAD_SIZE>, impl Buffer<Payload<PAYLOAD_SIZE>>>,
+) -> ! {
+    loop {
+        let (_, payload) = rx.recv();
+        tx.send_from(&payload);
     }
 }
 
