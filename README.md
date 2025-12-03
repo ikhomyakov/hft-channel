@@ -42,7 +42,7 @@ This design is intended for **HFT**, **trading engines**, **matching engines**, 
 hft-channel = "0.1"
 ```
 
-## Example
+## Quick Example
 
 ```rust
 use hft-channel::spmc_broadcast::channel;
@@ -80,13 +80,10 @@ Pattern:
 
 ## Benchmarks
 
-Run the provided micro-benchmarks:
-
 ```bash
-cargo bench
+RUSTFLAGS="-C target-cpu=native" cargo build --release --example bench
+./target/release/examples/bench both 1
 ```
-
-Or see examples in `examples/`.
 
 ## Testing
 

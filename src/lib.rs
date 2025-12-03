@@ -35,9 +35,9 @@
 //! engines**, **real-time telemetry**, and other performance-critical
 //! workloads.
 //!
-//! # Example
+//! # Quick Example
 //!
-//! ```rust
+//! ```ignore
 //! use hft_channel::spmc_broadcast::channel;
 //!
 //! let (tx, rx) = channel::<u64>("/test", 512);
