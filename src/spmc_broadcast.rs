@@ -60,7 +60,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// * the shared-memory object cannot be created
 /// * the name is invalid or does not begin with `'/'`
 /// * or any OS-level shared-memory operation fails
-pub fn channel<T: Clone + Copy + Default + Debug + Send + 'static>(
+pub fn channel<T: Clone + Copy + Default + Send + 'static>(
     shm_name: impl AsRef<str>,
     capacity: usize,
 ) -> std::io::Result<(Sender<T, ShmBuffer<T>>, Receiver<T, ShmBuffer<T>>)> {
@@ -102,7 +102,7 @@ pub fn channel<T: Clone + Copy + Default + Debug + Send + 'static>(
 /// The `Sender` is **not** clonable, preserving the single-producer
 /// invariant for the shared ring buffer.
 
-pub fn local_channel<T: Clone + Default + Debug + Send>(
+pub fn local_channel<T: Clone + Default + Send>(
     capacity: usize,
 ) -> (Sender<T, HeapBuffer<T>>, Receiver<T, HeapBuffer<T>>) {
     let buffer = HeapBuffer::new(capacity);
@@ -474,7 +474,7 @@ pub struct Sender<T, B: Buffer<T>> {
     /// - `seq_no % capacity`  
     /// - or, more efficiently (since capacity is a power of two):
     ///   `seq_no & capacity_mask`
-    seq_no: Cell<u64>,
+    seq_no: Cell<u64>, // Provides interior mutability and intentionally makes Receiver !Sync
 
     /// Shared backing buffer for the ring.
     buffer: Arc<B>,
@@ -693,7 +693,7 @@ impl<T: Clone + Default + Send, B: Buffer<T>> Sender<T, B> {
 #[derive(Debug)]
 pub struct Receiver<T, B: Buffer<T>> {
     /// The receiver's current `seq_no`, i.e. the `seq_no` of expected message.
-    seq_no: Cell<u64>,
+    seq_no: Cell<u64>, // Provides interior mutability and intentionally makes Receiver !Sync
 
     /// Shared backing buffer for the ring.
     buffer: Arc<B>,
@@ -709,7 +709,7 @@ pub struct Receiver<T, B: Buffer<T>> {
     _marker: PhantomData<T>,
 }
 
-impl<T: Clone + Default + Debug, B: Buffer<T>> Receiver<T, B> {
+impl<T: Clone + Default, B: Buffer<T>> Receiver<T, B> {
     /// Constructs a receiver positioned at the current dirty slot.
     ///
     /// This scans the buffer for the slot currently marked dirty
