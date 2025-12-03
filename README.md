@@ -6,7 +6,7 @@ Provides predictable performance, minimal contention, and carefully controlled m
 Works for **thread-to-thread broadcasting** via local memory, or **inter-process communication** using shared memory.
 
 [![Crates.io](https://img.shields.io/crates/v/hft-channel.svg)](https://crates.io/crates/hft-channel)
-[![Documentation](https://docs.rs/ichannel/badge.svg)](https://docs.rs/hft-channel)
+[![Documentation](https://docs.rs/hft-channel/badge.svg)](https://docs.rs/hft-channel)
 [![License: LGPL-3.0-or-later](https://img.shields.io/badge/License-LGPL%203.0--or--later-blue.svg)](https://www.gnu.org/licenses/lgpl-3.0)
 [![Rust](https://img.shields.io/badge/rust-stable-brightgreen.svg)](https://www.rust-lang.org)
 
