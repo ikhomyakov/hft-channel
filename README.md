@@ -82,7 +82,8 @@ Pattern:
 
 ```bash
 RUSTFLAGS="-C target-cpu=native" cargo build --release --example bench
-./target/release/examples/bench broadcast 2
+./target/release/examples/bench --help
+./target/release/examples/bench broadcast -p 1000 -m 2
 ```
 
 ## Testing
