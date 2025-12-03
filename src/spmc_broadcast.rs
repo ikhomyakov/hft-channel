@@ -2,6 +2,7 @@ use crate::{map_shared_memory, unmap_shared_memory};
 use crossbeam_utils::CachePadded;
 use std::cell::Cell;
 use std::fmt::Debug;
+use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -143,8 +144,7 @@ pub trait Buffer<T> {
 ///
 /// `HeapBuffer` owns a contiguous array of [`Message<T>`] values
 /// allocated on the heap. It implements the [`Buffer<T>`] trait and is
-/// used by [`local_channel`](crate::local_channel) to provide an
-/// in-process channel.
+/// used by [`local_channel`] to provide an in-process channel.
 ///
 /// The buffer has a power-of-two capacity, allowing sequence numbers
 /// to be mapped to slot indices by simple wrap-around.
@@ -238,17 +238,16 @@ impl<T: Default> HeapBuffer<T> {
 ///
 /// `ShmBuffer` provides typed access to a region of shared memory
 /// containing a contiguous array of [`Message<T>`] values. It implements
-/// the [`Buffer<T>`] trait and is used by [`channel`](crate::channel)
-/// to create inter-process channels.
+/// the [`Buffer<T>`] trait and is used by [`channel`] to create
+/// inter-process channels.
 ///
 /// Like `HeapBuffer`, this structure represents a power-of-two–sized
 /// ring. Sequence numbers are mapped into slot indices by wrapping the
 /// sequence number into range using a bitmask (`capacity_mask`).
 ///
-/// The underlying shared-memory object is created or opened externally
-/// (via [`try_new`](Self::try_new)), and remains valid for the lifetime
-/// of the `ShmBuffer`. When the last `Arc<ShmBuffer<T>>` is dropped, the
-/// region is automatically unmapped.
+/// The underlying shared-memory object is created or opened externally,
+/// and remains valid for the lifetime of the `ShmBuffer`. When the last
+/// `Arc<ShmBuffer<T>>` is dropped, the region is automatically unmapped.
 #[derive(Debug)]
 pub struct ShmBuffer<T> {
     ptr: NonNull<Message<T>>,
@@ -323,7 +322,7 @@ impl<T> Drop for ShmBuffer<T> {
     /// Unmaps the underlying shared-memory region.
     ///
     /// This method is automatically invoked when the last `Arc<ShmBuffer<T>>`
-    /// is dropped. It calls [`unmap_shared_memory`] with the pointer and
+    /// is dropped. It calls `unmap_shared_memory` with the pointer and
     /// capacity originally used to map the region.
     ///
     /// # Panics
@@ -333,7 +332,11 @@ impl<T> Drop for ShmBuffer<T> {
     /// can break other processes relying on the same region.
     fn drop(&mut self) {
         unsafe {
-            unmap_shared_memory(self.ptr.cast(), self.capacity).expect("ShmBuffer::drop failed");
+            unmap_shared_memory(
+                self.ptr.cast(),
+                self.capacity * std::mem::size_of::<Message<T>>(),
+            )
+            .expect("ShmBuffer::drop failed");
         }
     }
 }
@@ -393,6 +396,7 @@ impl State {
     /// Stores a new `(dirty, seq_no)` pair with the given memory ordering.
     #[inline(always)]
     fn store(&self, dirty: bool, seq_no: u64, order: Ordering) {
+        debug_assert!(seq_no < DIRTY_MASK);
         let v = seq_no | ((dirty as u64) << DIRTY_BIT);
         self.0.store(v, order);
     }
@@ -400,7 +404,7 @@ impl State {
 
 impl Debug for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (dirty, seq_no) = self.load(Ordering::SeqCst);
+        let (dirty, seq_no) = self.load(Ordering::Acquire);
         f.debug_struct("State")
             .field("dirty", &dirty)
             .field("seq_no", &seq_no)
@@ -475,7 +479,7 @@ pub struct Sender<T, B: Buffer<T>> {
     /// Shared backing buffer for the ring.
     buffer: Arc<B>,
 
-    _marker: std::marker::PhantomData<T>,
+    _marker: PhantomData<T>,
 }
 
 impl<T: Clone + Default + Send, B: Buffer<T>> Sender<T, B> {
@@ -489,14 +493,14 @@ impl<T: Clone + Default + Send, B: Buffer<T>> Sender<T, B> {
     /// and initializes the entire ring buffer to a valid starting state.
     fn new(buffer: Arc<B>) -> Self {
         if let Some(i) = (0..buffer.capacity() as u64).position(|i| {
-            let (dirty, seq_no) = unsafe { buffer.slot(i).state.load(Ordering::SeqCst) };
+            let (dirty, seq_no) = unsafe { buffer.slot(i).state.load(Ordering::Acquire) };
             dirty && seq_no != 0
         }) {
-            let (_, seq_no) = unsafe { buffer.slot(i as u64).state.load(Ordering::SeqCst) };
+            let (_, seq_no) = unsafe { buffer.slot(i as u64).state.load(Ordering::Acquire) };
             Self {
                 seq_no: Cell::new(seq_no),
-                buffer: buffer,
-                _marker: std::marker::PhantomData,
+                buffer,
+                _marker: PhantomData,
             }
         } else {
             Self::with_init(buffer)
@@ -535,8 +539,8 @@ impl<T: Clone + Default + Send, B: Buffer<T>> Sender<T, B> {
 
         Self {
             seq_no: Cell::new(1),
-            buffer: buffer,
-            _marker: std::marker::PhantomData,
+            buffer,
+            _marker: PhantomData,
         }
     }
 
@@ -592,13 +596,13 @@ impl<T: Clone + Default + Send, B: Buffer<T>> Sender<T, B> {
             self.buffer
                 .slot_mut(next_seq_no)
                 .state
-                .store(true, next_seq_no, Ordering::SeqCst);
+                .store(true, next_seq_no, Ordering::Release);
         }
         unsafe {
             self.buffer
                 .slot_mut(seq_no)
                 .state
-                .store(false, seq_no, Ordering::SeqCst);
+                .store(false, seq_no, Ordering::Release);
         }
     }
 
@@ -702,7 +706,7 @@ pub struct Receiver<T, B: Buffer<T>> {
     /// immediately after the read.
     recv_payload: T,
 
-    _marker: std::marker::PhantomData<T>,
+    _marker: PhantomData<T>,
 }
 
 impl<T: Clone + Default + Debug, B: Buffer<T>> Receiver<T, B> {
@@ -718,15 +722,15 @@ impl<T: Clone + Default + Debug, B: Buffer<T>> Receiver<T, B> {
     /// corrupted buffer state.
     fn new(buffer: Arc<B>) -> Self {
         if let Some(i) = (0..buffer.capacity() as u64).position(|i| {
-            let (dirty, seq_no) = unsafe { buffer.slot(i).state.load(Ordering::SeqCst) };
+            let (dirty, seq_no) = unsafe { buffer.slot(i).state.load(Ordering::Acquire) };
             dirty && seq_no != 0
         }) {
-            let (_, seq_no) = unsafe { buffer.slot(i as u64).state.load(Ordering::SeqCst) };
+            let (_, seq_no) = unsafe { buffer.slot(i as u64).state.load(Ordering::Acquire) };
             Self {
                 seq_no: Cell::new(seq_no),
                 buffer: buffer,
                 recv_payload: T::default(),
-                _marker: std::marker::PhantomData,
+                _marker: PhantomData,
             }
         } else {
             panic!("Uninitialized buffer!"); // TODO: will panic if we start receiver before sender
@@ -773,17 +777,22 @@ impl<T: Clone + Default + Debug, B: Buffer<T>> Receiver<T, B> {
 
     /// Non-blocking receive attempt.
     ///
-    /// Attempts to read the current slot without waiting.
+    /// Attempts to read the current slot **without blocking**.
     ///
     /// Returns:
     ///
-    /// - `(seq_no, Some(&T))` if the slot is clean **and** not overwritten
-    ///   during the copy. The receiver advances.
+    /// - `(seq_no, Some(&T))` if the slot is clean and the value was **not**
+    ///   overwritten during the read.
+    ///
     /// - `(seq_no, None)` if:
     ///   - the slot is still dirty, or
-    ///   - the slot was overwritten during the copy.
+    ///   - the slot was overwritten during the read.
     ///
-    /// In the failure case, the receiver **does not advance**.
+    /// Behavior:
+    ///
+    /// - If the slot is dirty, the receiver **does not advance**.
+    /// - If the slot was overwritten, no payload is delivered, but the receiver
+    ///   updates its state to the newly observed `seq_no`.
     #[inline(always)]
     pub fn try_recv(&mut self) -> (u64, Option<&T>) {
         let (dirty, seq_no) = self.load_state(self.seq_no.get());
@@ -813,7 +822,7 @@ impl<T: Clone + Default + Debug, B: Buffer<T>> Receiver<T, B> {
     /// sender, the returned reference is only valid as long as the slot is
     /// not overwritten.
     ///
-    /// Use this together with [`Receiver::advance_checked`] to validate the peek:
+    /// Use this together with [`Receiver::advance`] to validate the peek:
     ///
     /// ```ignore
     /// loop {
@@ -832,7 +841,7 @@ impl<T: Clone + Default + Debug, B: Buffer<T>> Receiver<T, B> {
     ///
     /// The caller must ensure that the reference is not used after the slot
     /// has potentially been overwritten. In practice, you must call
-    /// [`Receiver::advance_checked`] and check its return value before relying on
+    /// [`Receiver::advance`] and check its return value before relying on
     /// any work derived from `payload`.
     #[inline(always)]
     pub unsafe fn peek_unsafe(&self) -> (u64, &T) {
@@ -897,7 +906,7 @@ impl<T: Clone + Default + Debug, B: Buffer<T>> Receiver<T, B> {
         // Spin-wait on `dirty` flag
         let slot = unsafe { self.buffer.slot(self.seq_no.get()) };
         let seq_no = loop {
-            let (dirty, seq_no) = slot.state.load(Ordering::SeqCst);
+            let (dirty, seq_no) = slot.state.load(Ordering::Acquire);
             if !dirty {
                 break seq_no;
             }
@@ -909,7 +918,7 @@ impl<T: Clone + Default + Debug, B: Buffer<T>> Receiver<T, B> {
     /// Returns `(dirty, seq_no)` at `seq_no` position without blocking.
     #[inline(always)]
     fn load_state(&self, seq_no: u64) -> (bool, u64) {
-        unsafe { self.buffer.slot(seq_no).state.load(Ordering::SeqCst) }
+        unsafe { self.buffer.slot(seq_no).state.load(Ordering::Acquire) }
     }
 }
 
@@ -919,7 +928,7 @@ impl<T: Clone, B: Buffer<T>> Clone for Receiver<T, B> {
             seq_no: self.seq_no.clone(),
             buffer: Arc::clone(&self.buffer),
             recv_payload: self.recv_payload.clone(),
-            _marker: std::marker::PhantomData,
+            _marker: PhantomData,
         }
     }
 }
@@ -933,13 +942,13 @@ mod tests {
     #[test]
     fn state_packs_and_unpacks_clean() {
         let s = State::new(false, 123);
-        let (dirty, seq) = s.load(Ordering::SeqCst);
+        let (dirty, seq) = s.load(Ordering::Acquire);
         assert!(!dirty);
         assert_eq!(seq, 123);
 
         // overwrite via store
-        s.store(false, 999, Ordering::SeqCst);
-        let (dirty2, seq2) = s.load(Ordering::SeqCst);
+        s.store(false, 999, Ordering::Release);
+        let (dirty2, seq2) = s.load(Ordering::Acquire);
         assert!(!dirty2);
         assert_eq!(seq2, 999);
     }
@@ -947,12 +956,12 @@ mod tests {
     #[test]
     fn state_packs_and_unpacks_dirty() {
         let s = State::new(true, 42);
-        let (dirty, seq) = s.load(Ordering::SeqCst);
+        let (dirty, seq) = s.load(Ordering::Acquire);
         assert!(dirty);
         assert_eq!(seq, 42);
 
-        s.store(true, 777, Ordering::SeqCst);
-        let (dirty2, seq2) = s.load(Ordering::SeqCst);
+        s.store(true, 777, Ordering::Release);
+        let (dirty2, seq2) = s.load(Ordering::Acquire);
         assert!(dirty2);
         assert_eq!(seq2, 777);
     }
@@ -973,7 +982,7 @@ mod tests {
 
         for idx in 0..buffer.capacity() {
             let slot = unsafe { buffer.slot(idx as u64) };
-            let (dirty, seq_no) = slot.state.load(Ordering::SeqCst);
+            let (dirty, seq_no) = slot.state.load(Ordering::Acquire);
 
             if idx == 1 {
                 assert!(dirty, "slot 1 must be dirty after init");
@@ -1007,7 +1016,7 @@ mod tests {
         let mut dirty_indices = Vec::new();
         for idx in 0..buffer.capacity() {
             let slot = unsafe { buffer.slot(idx as u64) };
-            let (dirty, seq_no) = slot.state.load(Ordering::SeqCst);
+            let (dirty, seq_no) = slot.state.load(Ordering::Acquire);
 
             if dirty {
                 dirty_indices.push(idx);
@@ -1036,14 +1045,14 @@ mod tests {
 
         // Now slot 2 should be clean with seq_no = 2 and payload = 22
         let slot1 = unsafe { buffer.slot(2u64) };
-        let (dirty1, seq1_again) = slot1.state.load(Ordering::SeqCst);
+        let (dirty1, seq1_again) = slot1.state.load(Ordering::Acquire);
         assert!(!dirty1, "slot 2 should be clean after second send");
         assert_eq!(seq1_again, 2);
         assert_eq!(*slot1.payload, 22);
 
         // Still only one dirty slot in the ring
         let dirty_count = (0..buffer.capacity())
-            .filter(|&i| unsafe { buffer.slot(i as u64).state.load(Ordering::SeqCst).0 })
+            .filter(|&i| unsafe { buffer.slot(i as u64).state.load(Ordering::Acquire).0 })
             .count();
 
         assert_eq!(dirty_count, 1, "exactly one dirty slot must be preserved");
