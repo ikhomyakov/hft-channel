@@ -31,7 +31,7 @@ impl<const N: usize> Default for Payload<N> {
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} writer|reader|both", args[0]);
+        eprintln!("Usage: {} writer|reader|both [max_readers]", args[0]);
         std::process::exit(1);
     }
 
@@ -57,14 +57,26 @@ fn main() -> std::io::Result<()> {
             let (tx, rx) = local_channel::<Payload<PAYLOAD_SIZE>>(BUFFER_LEN);
 
             let cores = core_affinity::get_core_ids().unwrap();
-            dbg!(&cores);
             assert!(
                 cores.len() > 1,
                 "At least 2 CPU cores are required (found {}).",
                 cores.len()
             );
 
-            let readers: Vec<_> = (2..cores.len().min(2 + 2))
+            let max_readers = if args.len() > 2 {
+                args[2]
+                    .parse()
+                    .expect(&format!("failed to parse `max_readers` {:?}", args[2]))
+            } else {
+                2
+            };
+
+            println!(
+                "Running 1 writer and {} readers",
+                (cores.len() - 2).min(max_readers)
+            );
+
+            let readers: Vec<_> = (2..cores.len().min(2 + max_readers))
                 .map(|i| {
                     let rx = rx.clone();
                     let core_id = cores[i].clone();
@@ -74,7 +86,7 @@ fn main() -> std::io::Result<()> {
                     })
                 })
                 .collect();
-            
+
             let core_id = cores[1].clone();
             let writer = std::thread::spawn(move || {
                 core_affinity::set_for_current(core_id);
@@ -91,7 +103,7 @@ fn main() -> std::io::Result<()> {
             Ok(())
         }
         _ => {
-            eprintln!("Usage: {} writer|reader|both", args[0]);
+            eprintln!("Usage: {} writer|reader|both [max_readers]", args[0]);
             std::process::exit(1);
         }
     }
