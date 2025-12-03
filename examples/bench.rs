@@ -1,3 +1,4 @@
+use clap::{Parser, Subcommand};
 use crossbeam_utils::CachePadded;
 use hft_channel::{
     Trials, mono_time_ns,
@@ -8,7 +9,7 @@ use hft_channel::{
 compile_error!("This crate only supports Unix-like operating systems.");
 
 const BUFFER_LEN: usize = 4096;
-const PAYLOAD_SIZE: usize = 400;
+const PAYLOAD_SIZE: usize = 392;
 const TRIALS: usize = 100_000;
 
 /// Example payload type used in each ring-buffer slot (wrapped in a `Message`).
@@ -28,46 +29,132 @@ impl<const N: usize> Default for Payload<N> {
     }
 }
 
+#[derive(Parser, Debug)]
+#[command(version, about = "Benchmarks for an SPMC broadcast channel", long_about = None)]
+struct Args {
+    /// Operation mode, selected via subcommand.
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Sends messages to a shared-memory channel.
+    Writer {
+        /// Minimum period between messages in nanoseconds; 0 disables throttling.
+        #[arg(short = 'p', long = "period", default_value_t = 0)]
+        period: u64,
+
+        /// Output shared-memory segment name, which must begin with ‘/’.
+        #[arg(short = 'o', long = "output", default_value = "test-reader-writer")]
+        output: String,
+    },
+
+    /// Receives messages from a shared-memory channel.
+    Reader {
+        /// Input shared-memory segment name, which must begin with ‘/’.
+        #[arg(short = 'i', long = "input", default_value = "test-reader-writer")]
+        input: String,
+    },
+
+    /// Sends messages to a server via a shared-memory channel and
+    /// receives responses on the server’s output channel.
+    Client {
+        /// Minimum period between messages in nanoseconds; 0 disables throttling.
+        #[arg(short = 'p', long = "period", default_value_t = 0)]
+        period: u64,
+
+        /// Output shared-memory segment name, which must begin with ‘/’.
+        #[arg(short = 'o', long = "output", default_value = "test-client-server")]
+        output: String,
+
+        /// Input shared-memory segment name, which must begin with ‘/’.
+        #[arg(short = 'i', long = "input", default_value = "test-server-client")]
+        input: String,
+    },
+
+    /// Receives messages on an input shared-memory channel and echoes
+    /// them onto an output shared-memory channel.
+    Server {
+        /// Input shared-memory segment name, which must begin with ‘/’.
+        #[arg(short = 'i', long = "input", default_value = "test-client-server")]
+        input: String,
+
+        /// Output shared-memory segment name, which must begin with ‘/’.
+        #[arg(short = 'o', long = "output", default_value = "test-server-client")]
+        output: String,
+    },
+
+    /// Runs one writer and multiple readers using an internal memory channel.
+    Broadcast {
+        /// Minimum period between messages in nanoseconds; 0 disables throttling.
+        #[arg(short = 'p', long = "period", default_value_t = 0)]
+        period: u64,
+
+        /// Maximum number of readers.
+        #[arg(short = 'm', long = "max-readers", default_value_t = 4)]
+        max_readers: usize,
+    },
+
+    /// Runs a client and a server over a pair of internal memory channels.
+    Ping {
+        /// Minimum period between messages in nanoseconds; 0 disables throttling.
+        #[arg(short = 'p', long = "period", default_value_t = 0)]
+        period: u64,
+    },
+}
+
 fn main() -> std::io::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!(
-            "Usage: {} writer|reader|client|server|ping|broadcast [max_readers]",
-            args[0]
-        );
-        std::process::exit(1);
-    }
+    let args = Args::parse();
 
     println!(
-        "Message size: {}, payload size: {}, cache padded payload size: {}, buffer length: {}, buffer size: {}",
+        "message size: {}, payload size: {}, cache padded payload size: {}, buffer length: {}, buffer size: {}, trials: {}",
         std::mem::size_of::<Message<Payload<PAYLOAD_SIZE>>>(),
         std::mem::size_of::<Payload<PAYLOAD_SIZE>>(),
         std::mem::size_of::<CachePadded<Payload<PAYLOAD_SIZE>>>(),
         BUFFER_LEN,
-        std::mem::size_of::<Message<Payload<PAYLOAD_SIZE>>>() * BUFFER_LEN
+        std::mem::size_of::<Message<Payload<PAYLOAD_SIZE>>>() * BUFFER_LEN,
+        TRIALS,
     );
 
-    match args[1].as_str() {
-        "writer" => {
-            let (tx, _) = channel("/test-reader-writer", BUFFER_LEN)?;
-            dbg!(&tx);
-            writer(tx)
+    match args.command {
+        Commands::Writer { period, output } => {
+            println!("period: {}, output: {:?}", period, output);
+            let (tx, _) = channel(&output, BUFFER_LEN)?;
+            writer(tx, period)
         }
-        "reader" => {
-            let (_, rx) = channel("/test-reader-writer", BUFFER_LEN)?;
+
+        Commands::Reader { input } => {
+            println!("input: {:?}", input);
+            let (_, rx) = channel(&input, BUFFER_LEN)?;
             reader(rx)
         }
-        "client" => {
-            let (tx1, _) = channel("/test-client-server", BUFFER_LEN)?;
-            let (_, rx2) = channel("/test-server-client", BUFFER_LEN)?;
-            client(tx1, rx2)
+
+        Commands::Client {
+            input,
+            output,
+            period,
+        } => {
+            println!(
+                "period: {}, output: {:?}, input: {:?}",
+                period, output, input
+            );
+            let (tx1, _) = channel(output, BUFFER_LEN)?;
+            let (_, rx2) = channel(input, BUFFER_LEN)?;
+            client(tx1, rx2, period)
         }
-        "server" => {
-            let (_, rx1) = channel("/test-client-server", BUFFER_LEN)?;
-            let (tx2, _) = channel("/test-server-client", BUFFER_LEN)?;
+
+        Commands::Server { input, output } => {
+            println!("output: {:?}, input: {:?}", output, input);
+            let (_, rx1) = channel(input, BUFFER_LEN)?;
+            let (tx2, _) = channel(output, BUFFER_LEN)?;
             server(tx2, rx1)
         }
-        "broadcast" => {
+
+        Commands::Broadcast {
+            period,
+            max_readers,
+        } => {
             let (tx, rx) = local_channel(BUFFER_LEN);
 
             let cores = core_affinity::get_core_ids().unwrap();
@@ -77,16 +164,9 @@ fn main() -> std::io::Result<()> {
                 cores.len()
             );
 
-            let max_readers = if args.len() > 2 {
-                args[2]
-                    .parse()
-                    .expect(&format!("failed to parse `max_readers` {:?}", args[2]))
-            } else {
-                2
-            };
-
             println!(
-                "Running 1 writer and {} readers",
+                "period: {}, n_readers: {}",
+                period,
                 (cores.len() - 2).min(max_readers)
             );
 
@@ -104,7 +184,7 @@ fn main() -> std::io::Result<()> {
             let core_id = cores[1].clone();
             let writer = std::thread::spawn(move || {
                 core_affinity::set_for_current(core_id);
-                writer(tx)
+                writer(tx, period)
             });
 
             readers
@@ -116,7 +196,9 @@ fn main() -> std::io::Result<()> {
 
             Ok(())
         }
-        "ping" => {
+        Commands::Ping { period } => {
+            println!("period: {}", period);
+
             let (tx1, rx1) = local_channel(BUFFER_LEN);
             let (tx2, rx2) = local_channel(BUFFER_LEN);
 
@@ -136,19 +218,12 @@ fn main() -> std::io::Result<()> {
             let core_id = cores[2].clone();
             let client = std::thread::spawn(move || {
                 core_affinity::set_for_current(core_id);
-                client(tx1, rx2)
+                client(tx1, rx2, period)
             });
 
             client.join().unwrap()?;
 
             Ok(())
-        }
-        _ => {
-            eprintln!(
-                "Usage: {} writer|reader|client|server|ping|broadcast [max_readers]",
-                args[0]
-            );
-            std::process::exit(1);
         }
     }
 }
@@ -157,8 +232,10 @@ fn main() -> std::io::Result<()> {
 fn client(
     tx: Sender<Payload<PAYLOAD_SIZE>, impl Buffer<Payload<PAYLOAD_SIZE>>>,
     mut rx: Receiver<Payload<PAYLOAD_SIZE>, impl Buffer<Payload<PAYLOAD_SIZE>>>,
+    period: u64,
 ) -> std::io::Result<()> {
-    let mut trials = Trials::with_capacity(TRIALS);
+    let mut trials: Trials<u64> = Trials::with_capacity(TRIALS);
+    let mut trials2: Trials<u64> = Trials::with_capacity(TRIALS);
 
     let mut payload = Payload::<PAYLOAD_SIZE>::default();
 
@@ -170,13 +247,19 @@ fn client(
         let ts1 = payload.timestamp;
         let ts2 = mono_time_ns();
         trials.push(ts2 - ts1);
+
+        let ts3 = delay(ts0 + period);
+        trials2.push(ts3 - ts0);
+
         if trials.len() == TRIALS {
             break;
         }
     }
 
     trials.sort();
+    trials2.sort();
     trials.print_csv("D");
+    trials2.print_csv("Y");
 
     Ok(())
 }
@@ -192,12 +275,25 @@ fn server(
     }
 }
 
+/// Busy-waits until the current monotonic time reaches or exceeds `deadline_ns`.
+#[inline(always)]
+fn delay(deadline_ns: u64) -> u64 {
+    loop {
+        let ts = mono_time_ns();
+        if ts >= deadline_ns {
+            break ts;
+        }
+    }
+}
+
 #[inline(never)]
 fn writer(
     tx: Sender<Payload<PAYLOAD_SIZE>, impl Buffer<Payload<PAYLOAD_SIZE>>>,
+    period: u64,
 ) -> std::io::Result<()> {
     let mut trials = Trials::with_capacity(TRIALS);
     let mut trials2 = Trials::with_capacity(TRIALS);
+    let mut trials3 = Trials::with_capacity(TRIALS);
 
     let mut payload = Payload::<PAYLOAD_SIZE>::default();
 
@@ -209,6 +305,10 @@ fn writer(
         let ts2 = mono_time_ns();
         trials.push(ts1 - ts0);
         trials2.push(ts2 - ts1);
+
+        let ts3 = delay(ts0 + period);
+        trials3.push(ts3 - ts0);
+
         if trials.len() == TRIALS {
             break;
         }
@@ -216,8 +316,10 @@ fn writer(
 
     trials.sort();
     trials2.sort();
+    trials3.sort();
     trials.print_csv("A");
     trials2.print_csv("X");
+    trials3.print_csv("Y");
 
     Ok(())
 }
