@@ -7,6 +7,11 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub type ShmSender<T> = Sender<T, ShmBuffer<T>>;
+pub type ShmReceiver<T> = Receiver<T, ShmBuffer<T>>;
+pub type HeapSender<T> = Sender<T, HeapBuffer<T>>;
+pub type HeapReceiver<T> = Receiver<T, HeapBuffer<T>>;
+
 /// Creates a shared-memory channel backed by a `ShmBuffer`.
 ///
 /// This is the primary constructor for an inter-process channel.  
@@ -63,7 +68,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub fn channel<T: Clone + Copy + Default + Send + 'static>(
     shm_name: impl AsRef<str>,
     capacity: usize,
-) -> std::io::Result<(Sender<T, ShmBuffer<T>>, Receiver<T, ShmBuffer<T>>)> {
+) -> std::io::Result<(ShmSender<T>, ShmReceiver<T>)> {
     let buffer = ShmBuffer::try_new(capacity, shm_name.as_ref())?;
     Ok((Sender::new(buffer.clone()), Receiver::new(buffer)))
 }
@@ -101,10 +106,9 @@ pub fn channel<T: Clone + Copy + Default + Send + 'static>(
 ///
 /// The `Sender` is **not** clonable, preserving the single-producer
 /// invariant for the shared ring buffer.
-
 pub fn local_channel<T: Clone + Default + Send>(
     capacity: usize,
-) -> (Sender<T, HeapBuffer<T>>, Receiver<T, HeapBuffer<T>>) {
+) -> (HeapSender<T>, HeapReceiver<T>) {
     let buffer = HeapBuffer::new(capacity);
     (Sender::new(buffer.clone()), Receiver::new(buffer))
 }
@@ -123,6 +127,11 @@ pub fn local_channel<T: Clone + Default + Send>(
 pub trait Buffer<T> {
     /// Returns an immutable reference to the slot corresponding to
     /// the given sequence number.
+    ///
+    /// # Safety
+    /// Caller must ensure that the `seq_no` hasn't changed while the
+    /// caller was working with the reference.
+    #[allow(clippy::missing_safety_doc)]
     unsafe fn slot(&self, seq_no: u64) -> &Message<T>;
 
     /// Returns a mutable reference to the slot corresponding to the
@@ -130,6 +139,10 @@ pub trait Buffer<T> {
     ///
     /// Implementors must ensure that the returned reference is valid
     /// and uniquely borrowed.
+    ///
+    /// # Safety
+    /// Caller must ensure no aliasing mutable refs.
+    #[allow(clippy::mut_from_ref)]
     unsafe fn slot_mut(&self, seq_no: u64) -> &mut Message<T>;
 
     /// Returns the effective capacity of the ring buffer.
@@ -550,7 +563,7 @@ impl<T: Clone + Default + Send, B: Buffer<T>> Sender<T, B> {
     ///
     /// - No backpressure and no blocking.
     /// - Always returns a writable slot; it is the caller's responsibility
-    /// to keep up and tolerate overwrites if necessary.
+    ///   to keep up and tolerate overwrites if necessary.
     ///
     /// Returns the current `seq_no` and a mutable reference to the payload of
     /// the next writable slot.
@@ -571,6 +584,12 @@ impl<T: Clone + Default + Send, B: Buffer<T>> Sender<T, B> {
     /// reserved slot ready for writing. It simply exposes that slot without
     /// performing any state transitions, so calling `reserve` repeatedly—or
     /// even without a matching `commit`—is harmless.
+    ///
+    /// # Safety
+    /// Returns a `&mut T` from `&self` based on internal invariants that
+    /// guarantee the slot is uniquely owned at this moment. Caller must
+    /// ensure no aliasing or concurrent access to the same slot.
+    #[allow(clippy::mut_from_ref)]
     #[inline(always)]
     pub fn reserve(&self) -> (u64, &mut T) {
         let seq_no = self.seq_no.get();
@@ -728,7 +747,7 @@ impl<T: Clone + Default, B: Buffer<T>> Receiver<T, B> {
             let (_, seq_no) = unsafe { buffer.slot(i as u64).state.load(Ordering::Acquire) };
             Self {
                 seq_no: Cell::new(seq_no),
-                buffer: buffer,
+                buffer,
                 recv_payload: T::default(),
                 _marker: PhantomData,
             }
@@ -905,14 +924,13 @@ impl<T: Clone + Default, B: Buffer<T>> Receiver<T, B> {
     pub fn wait(&self) -> u64 {
         // Spin-wait on `dirty` flag
         let slot = unsafe { self.buffer.slot(self.seq_no.get()) };
-        let seq_no = loop {
+        loop {
             let (dirty, seq_no) = slot.state.load(Ordering::Acquire);
             if !dirty {
                 break seq_no;
             }
             core::hint::spin_loop(); // On x86_64 this adds asm instruction `pause`.
-        };
-        seq_no
+        }
     }
 
     /// Returns `(dirty, seq_no)` at `seq_no` position without blocking.

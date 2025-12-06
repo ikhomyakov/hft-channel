@@ -35,6 +35,10 @@ where
         self.trials.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.trials.len() == 0
+    }
+
     pub fn sort(&mut self) {
         self.trials.sort();
     }
